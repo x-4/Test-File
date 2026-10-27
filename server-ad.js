@@ -15,13 +15,19 @@ const https = require('https');
 const crypto = require('crypto');
 
 const ENV = { 
-    S_TKN: process.env.UUID || '00000000-0000-0000-0000-000000000000', 
+    S_TKN: process.env.UUID || '', 
     S_ORIGIN: 'https://www.microsoft.com',
     // 【核心修复1】适配 Alwaysdata 注入的内部 IP 和端口
     PORT: process.env.PORT || 8100,
     IP: process.env.IP || '0.0.0.0',
     XHTTP_PATH: process.env.XHTTP_PATH || '/xh'
 };
+
+// 缺少或非法 UUID 时直接退出：避免以可预测的空凭证对外提供服务
+if (!/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(ENV.S_TKN)) {
+    console.error('[FATAL] 环境变量 UUID 缺失或格式非法（需为标准 UUID，如 8-4-4-4-12 十六进制）。');
+    process.exit(1);
+}
 
 process.on('uncaughtException', () => {});
 process.on('unhandledRejection', () => {});
