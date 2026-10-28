@@ -3,10 +3,12 @@
 //
 // 纯 XHTTP（Xray SplitHTTP）传输的 VLESS 服务端，无 WebSocket 依赖。
 // 环境变量：
-//   UUID        必填，节点鉴权 ID（同时作为订阅路径 /<UUID>）
-//   PORT        监听端口，默认 8100
-//   IP          监听地址，默认 0.0.0.0
-//   XHTTP_PATH  XHTTP 传输路径，默认 /xh
+//   UUID             必填，节点鉴权 ID（同时作为订阅路径 /<UUID>）
+//   PORT             监听端口，默认 8100
+//   IP               监听地址，默认 0.0.0.0
+//   XHTTP_PATH       XHTTP 传输路径，默认 /xh
+//   FALLBACK         未知路径兜底：decoy（默认，本地伪装站）| redirect（302）| proxy（受限反代）
+//   FALLBACK_ORIGIN  redirect / proxy 的目标站点（建议指向自有站点，避免热链第三方）
 // ====================================================================
 
 const http = require('http');
@@ -16,7 +18,10 @@ const crypto = require('crypto');
 
 const ENV = { 
     S_TKN: process.env.UUID || '', 
-    S_ORIGIN: 'https://www.microsoft.com',
+    // 兜底策略：decoy（本地伪装站，默认）| redirect（302 跳转）| proxy（受限反代）
+    FALLBACK: (process.env.FALLBACK || 'decoy').toLowerCase(),
+    // 仅 redirect / proxy 模式使用；建议指向你自己的站点，而不是第三方大站
+    S_ORIGIN: process.env.FALLBACK_ORIGIN || 'https://www.microsoft.com',
     // 【核心修复1】适配 Alwaysdata 注入的内部 IP 和端口
     PORT: process.env.PORT || 8100,
     IP: process.env.IP || '0.0.0.0',
@@ -215,19 +220,197 @@ const renderAIMatrix = (res) => {
 // 路由代理与订阅分发
 // ====================================================================
 
-const mirrorOrigin = (req, res) => {
-    const options = {
-        hostname: new URL(ENV.S_ORIGIN).hostname,
-        port: 443, path: req.url, method: req.method,
-        headers: { ...req.headers, host: new URL(ENV.S_ORIGIN).hostname }
-    };
-    const proxyReq = https.request(options, proxyRes => {
-        res.writeHead(proxyRes.statusCode, proxyRes.headers);
-        proxyRes.pipe(res, { end: true });
-    });
-    proxyReq.on('error', () => { res.writeHead(503); res.end(); });
-    req.pipe(proxyReq, { end: true });
+// ====================================================================
+// 兜底伪装：本地静态站 / 302 跳转 / 受限反代
+// ====================================================================
+
+const NO_STORE = { 'Cache-Control': 'no-store', 'Content-Type': 'text/plain; charset=utf-8' };
+
+// ---------- 本地静态伪装站（默认，零第三方流量）----------
+const PAGE_SHELL = (title, inner) => `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${title}</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>body{background:#050505;color:#cbd5e1;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}</style>
+</head><body class="min-h-screen flex flex-col">
+<nav class="border-b border-gray-800 px-6 py-4 flex items-center justify-between">
+  <a href="/" class="text-sky-400 font-bold tracking-widest">AETHER//MATRIX-CORE</a>
+  <span class="text-xs text-gray-500 space-x-4"><a href="/about" class="hover:text-sky-400">About</a>
+  <a href="/docs" class="hover:text-sky-400">Docs</a></span>
+</nav>
+<main class="flex-1 max-w-3xl mx-auto px-6 py-12">${inner}</main>
+<footer class="border-t border-gray-800 px-6 py-6 text-xs text-gray-600">© ${new Date().getFullYear()} Aether Matrix Core. All rights reserved.</footer>
+</body></html>`;
+
+const DECOY_PAGES = {
+    '/about': () => PAGE_SHELL('About — Aether Matrix Core', `
+        <h1 class="text-2xl font-bold text-gray-100 mb-4">About</h1>
+        <p class="text-sm leading-6 text-gray-400">Aether Matrix Core is an internal inference control plane used to schedule
+        transformer workloads across distributed GPU nodes. The console at the root path exposes live telemetry for
+        cluster utilisation, KV-cache synchronisation and stream routing.</p>
+        <p class="text-sm leading-6 text-gray-400 mt-4">The service is operated for research and development purposes.
+        Public endpoints only expose aggregated, non-personal metrics.</p>`),
+    '/docs': () => PAGE_SHELL('Docs — Aether Matrix Core', `
+        <h1 class="text-2xl font-bold text-gray-100 mb-4">Documentation</h1>
+        <ul class="text-sm space-y-3 text-gray-400">
+          <li><span class="text-sky-400">GET /</span> — live cluster console</li>
+          <li><span class="text-sky-400">GET /about</span> — service overview</li>
+          <li><span class="text-sky-400">GET /docs</span> — this page</li>
+          <li><span class="text-sky-400">GET /robots.txt</span> — crawler policy</li>
+        </ul>
+        <p class="text-xs text-gray-600 mt-6">All telemetry is refreshed every 800 ms from the edge aggregator.</p>`)
 };
+
+const renderNotFound = (res, pathname) => {
+    const safe = String(pathname || '/').replace(/[<>&"']/g, '');
+    const html = PAGE_SHELL('404 — Not Found', `
+        <h1 class="text-3xl font-bold text-gray-100 mb-3">404</h1>
+        <p class="text-sm text-gray-400">The resource <code class="text-gray-300">${safe}</code>
+        was not found on this server.</p>
+        <p class="text-sm text-gray-500 mt-6"><a href="/" class="text-sky-400 hover:underline">Return to console</a></p>`);
+    res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(html);
+};
+
+const ROBOTS_TXT = 'User-agent: *\nDisallow: /\n';
+const DECOY_ICON = Buffer.from(
+    'PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+' +
+    'PHJlY3Qgd2lkdGg9IjMyIiBoZWlnaHQ9IjMyIiByeD0iOCIgZmlsbD0iIzA1MDUwNSIvPjxwYXRoIGQ9Ik0xNiA2TDI2IDE2TDE2IDI2IDYgMTZaIiBmaWxsPSIjMzhiZGY4Ii8+PC9zdmc+',
+    'base64');
+
+const serveDecoy = (req, res, pathname) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+        res.writeHead(405, { ...NO_STORE, Allow: 'GET, HEAD' });
+        return res.end('Method Not Allowed');
+    }
+    if (pathname === '/robots.txt') {
+        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'public, max-age=3600' });
+        return res.end(ROBOTS_TXT);
+    }
+    if (pathname === '/favicon.ico' || pathname === '/favicon.svg') {
+        res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=86400' });
+        return res.end(DECOY_ICON);
+    }
+    const page = DECOY_PAGES[pathname];
+    if (page) {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+        return res.end(page());
+    }
+    renderNotFound(res, pathname);
+};
+
+// ---------- 302 跳转（零第三方流量，不当热链/反代）----------
+const fallbackRedirect = (req, res, pathname, search) => {
+    const target = ENV.S_ORIGIN.replace(/\/+$/, '') + pathname + (search || '');
+    res.writeHead(302, { Location: target, 'Cache-Control': 'no-store' });
+    res.end();
+};
+
+// ---------- 受限反代（默认关闭；仅 GET/HEAD + 体积/超时上限 + 缓存）----------
+const MIRROR_MAX_BYTES = 2 * 1024 * 1024;
+const MIRROR_TIMEOUT_MS = 6000;
+const MIRROR_CACHE_TTL_MS = 5 * 60 * 1000;
+const MIRROR_CACHE_MAX = 32;
+const mirrorCache = new Map();   // key -> { at, status, headers, body }
+
+const mirrorCacheGet = (key) => {
+    const hit = mirrorCache.get(key);
+    if (!hit) return null;
+    if (Date.now() - hit.at > MIRROR_CACHE_TTL_MS) { mirrorCache.delete(key); return null; }
+    return hit;
+};
+
+const mirrorCacheSet = (key, entry) => {
+    if (mirrorCache.size >= MIRROR_CACHE_MAX) mirrorCache.delete(mirrorCache.keys().next().value);
+    mirrorCache.set(key, entry);
+};
+
+const fallbackProxy = (req, res, pathname, search) => {
+    // 只允许只读方法，杜绝把节点当成匿名提交/上传跳板
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+        res.writeHead(405, { ...NO_STORE, Allow: 'GET, HEAD' });
+        return res.end('Method Not Allowed');
+    }
+
+    const key = pathname + (search || '');
+    const cached = mirrorCacheGet(key);
+    if (cached) {
+        res.writeHead(cached.status, cached.headers);
+        return res.end(cached.body);
+    }
+
+    let target;
+    try { target = new URL(key, ENV.S_ORIGIN); } catch (e) { return renderNotFound(res, pathname); }
+    if (target.protocol !== 'https:') return renderNotFound(res, pathname);
+
+    // 显式构造最小请求头：不再透传 cookie / authorization / referer / 请求体
+    const options = {
+        hostname: target.hostname,
+        port: target.port || 443,
+        path: target.pathname + target.search,
+        method: req.method === 'HEAD' ? 'HEAD' : 'GET',
+        timeout: MIRROR_TIMEOUT_MS,
+        headers: {
+            host: target.host,
+            'user-agent': req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+            accept: req.headers.accept || 'text/html,application/xhtml+xml',
+            'accept-encoding': 'identity'
+        }
+    };
+
+    let settled = false;
+    const fail = () => {
+        if (settled) return;
+        settled = true;
+        if (!res.headersSent) renderNotFound(res, pathname);
+        else { try { res.destroy(); } catch (e) {} }
+    };
+
+    const proxyReq = https.request(options, proxyRes => {
+        const status = proxyRes.statusCode || 502;
+        const ctype = proxyRes.headers['content-type'] || '';
+        // 仅缓存可安全复用的小型静态响应，其余直通且不缓存
+        const cacheable = status === 200 && /^(text\/|image\/|application\/javascript)/.test(ctype);
+
+        if (!cacheable) {
+            settled = true;
+            res.writeHead(status, { ...proxyRes.headers, 'Cache-Control': 'no-store' });
+            let sent = 0;
+            proxyRes.on('data', chunk => {
+                sent += chunk.length;
+                if (sent > MIRROR_MAX_BYTES) { try { proxyRes.destroy(); } catch (e) {} try { res.destroy(); } catch (e) {} return; }
+                res.write(chunk);
+            });
+            proxyRes.on('end', () => { if (!res.writableEnded) res.end(); });
+            proxyRes.on('error', () => { try { res.destroy(); } catch (e) {} });
+            return;
+        }
+
+        const chunks = [];
+        let size = 0;
+        proxyRes.on('data', chunk => {
+            size += chunk.length;
+            if (size > MIRROR_MAX_BYTES) { try { proxyRes.destroy(); } catch (e) {} return fail(); }
+            chunks.push(chunk);
+        });
+        proxyRes.on('end', () => {
+            if (settled) return;
+            settled = true;
+            const body = Buffer.concat(chunks);
+            const headers = { 'Content-Type': ctype, 'Cache-Control': 'public, max-age=300' };
+            mirrorCacheSet(key, { at: Date.now(), status, headers, body });
+            res.writeHead(status, headers);
+            res.end(body);
+        });
+        proxyRes.on('error', fail);
+    });
+
+    proxyReq.on('timeout', () => { proxyReq.destroy(); fail(); });
+    proxyReq.on('error', fail);
+    proxyReq.end();   // GET/HEAD 无 body，绝不转发请求体
+};
+
 
 const generateSubscription = (req, res) => {
     const rawHost = (req.headers.host || '').trim();
@@ -627,6 +810,58 @@ const handleXHTTP = (req, res, pathname) => {
     return true;
 };
 
+// ====================================================================
+// 未知路径兜底 + 扫描型滥用限速
+// ====================================================================
+
+const SCAN_WINDOW_MS = 60000;
+const SCAN_MAX_HITS = 40;        // 单 IP 每分钟允许的未知路径请求数
+const SCAN_TABLE_MAX = 20000;
+const scanTable = new Map();     // ip -> { count, resetAt }
+
+// PaaS/CDN 会终结 TLS 并使用自身 IP 回源，因此优先取 XFF 最右侧（由可信代理追加）以保证
+// 限速的按客户端粒度；缺失时退回 socket 地址。
+const clientIp = (req) => {
+    const xff = req.headers['x-forwarded-for'];
+    if (typeof xff === 'string' && xff.length) {
+        const last = xff.split(',').pop().trim();
+        if (last) return last;
+    }
+    return (req.socket && req.socket.remoteAddress) || 'unknown';
+};
+
+const isScanAbuser = (ip) => {
+    const now = Date.now();
+    let e = scanTable.get(ip);
+    if (!e || e.resetAt <= now) {
+        if (scanTable.size >= SCAN_TABLE_MAX) scanTable.clear();
+        e = { count: 0, resetAt: now + SCAN_WINDOW_MS };
+        scanTable.set(ip, e);
+    }
+    e.count++;
+    return e.count > SCAN_MAX_HITS;
+};
+
+const scanSweeper = setInterval(() => {
+    const now = Date.now();
+    for (const [ip, e] of scanTable) if (e.resetAt <= now) scanTable.delete(ip);
+}, 60000);
+if (scanSweeper.unref) scanSweeper.unref();
+
+const handleFallback = (req, res, pathname, search) => {
+    // 扫描器/爬虫对未知路径高频探测时，直接断开比返回内容更省资源
+    if (isScanAbuser(clientIp(req))) {
+        try { res.writeHead(429, { ...NO_STORE, 'Retry-After': '60' }); res.end('Too Many Requests'); } catch (e) {}
+        return;
+    }
+
+    switch (ENV.FALLBACK) {
+        case 'redirect': return fallbackRedirect(req, res, pathname, search);
+        case 'proxy': return fallbackProxy(req, res, pathname, search);
+        default: return serveDecoy(req, res, pathname);
+    }
+};
+
 const server = http.createServer((req, res) => {
     let url;
     try {
@@ -652,8 +887,8 @@ const server = http.createServer((req, res) => {
         return handleXHTTP(req, res, pathname);
     }
 
-    // 其他请求反代真实站点，规避主动探测
-    return mirrorOrigin(req, res);
+    // 其余请求走兜底策略（默认本地伪装站，不再反代第三方站点）
+    return handleFallback(req, res, pathname, url.search);
 });
 
 // 关闭 Nagle 以降低 XHTTP 小包延迟，并放宽头部/超时限制
