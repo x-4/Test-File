@@ -7,21 +7,16 @@
 //   PORT             监听端口，默认 8100
 //   IP               监听地址，默认 0.0.0.0
 //   XHTTP_PATH       XHTTP 传输路径，默认 /xh
-//   FALLBACK         未知路径兜底：decoy（默认，本地伪装站）| redirect（302）| proxy（受限反代）
-//   FALLBACK_ORIGIN  redirect / proxy 的目标站点（建议指向自有站点，避免热链第三方）
+//
+// 未知路径一律由本地静态伪装站响应，不存在任何第三方站点转发/跳转能力。
 // ====================================================================
 
 const http = require('http');
 const net = require('net');
-const https = require('https');
 const crypto = require('crypto');
 
 const ENV = { 
     S_TKN: process.env.UUID || '', 
-    // 兜底策略：decoy（本地伪装站，默认）| redirect（302 跳转）| proxy（受限反代）
-    FALLBACK: (process.env.FALLBACK || 'decoy').toLowerCase(),
-    // 仅 redirect / proxy 模式使用；建议指向你自己的站点，而不是第三方大站
-    S_ORIGIN: process.env.FALLBACK_ORIGIN || 'https://www.microsoft.com',
     // 【核心修复1】适配 Alwaysdata 注入的内部 IP 和端口
     PORT: process.env.PORT || 8100,
     IP: process.env.IP || '0.0.0.0',
@@ -86,189 +81,163 @@ Registry.set('parse', (buf) => {
 });
 
 // ====================================================================
-// 好莱坞级 AI 控制台界面 (前端伪装)
+// ====================================================================
+// AI 控制台界面 (前端伪装) —— 完全自包含，无任何外部 CDN/字体依赖
 // ====================================================================
 
+const BASE_CSS = `
+:root{--bg:#050505;--panel:rgba(15,20,25,.6);--line:#1f2937;--dim:#6b7280;--txt:#cbd5e1;--sky:#38bdf8;--indigo:#818cf8;--emerald:#34d399;--amber:#fbbf24}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--txt);font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;min-height:100vh;display:flex;flex-direction:column;
+background-image:linear-gradient(rgba(25,25,30,.5) 1px,transparent 1px),linear-gradient(90deg,rgba(25,25,30,.5) 1px,transparent 1px);background-size:30px 30px}
+a{color:inherit;text-decoration:none}
+nav{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);padding:16px 24px}
+.brand{color:var(--sky);font-weight:700;letter-spacing:.18em;text-shadow:0 0 10px rgba(56,189,248,.45)}
+.navlinks{font-size:12px;color:var(--dim);display:flex;gap:16px}
+.navlinks a:hover{color:var(--sky)}
+main{flex:1;max-width:1100px;margin:0 auto;width:100%;padding:24px}
+footer{border-top:1px solid var(--line);padding:20px 24px;font-size:11px;color:#4b5563}
+h1{font-size:20px;color:#f3f4f6;margin-bottom:14px}
+.glass{background:var(--panel);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,.05);border-radius:10px}
+.grid{display:grid;gap:16px}
+.g4{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
+.g2{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
+.card{padding:16px}
+.label{font-size:11px;color:var(--dim);letter-spacing:.08em}
+.metric{font-size:22px;font-weight:700;margin-top:4px}
+.bar{height:3px;background:#111827;border-radius:2px;margin-top:12px;overflow:hidden}
+.bar>i{display:block;height:100%;width:60%}
+.sky{color:var(--sky)}.indigo{color:var(--indigo)}.emerald{color:var(--emerald)}.amber{color:var(--amber)}
+.bg-sky{background:var(--sky)}.bg-indigo{background:var(--indigo)}.bg-emerald{background:var(--emerald)}.bg-amber{background:var(--amber)}
+.dim{color:var(--dim)}.small{font-size:12px}
+.terminal{font-size:11px;line-height:1.45;height:170px;overflow:hidden;color:#9ca3af}
+.chart{width:100%;height:230px;display:block}
+ul.docs{list-style:none;font-size:13px}
+ul.docs li{padding:6px 0;border-bottom:1px dashed #1f2937}
+code{color:#e5e7eb}
+`;
+
+const DASH_JS = `
+(function(){
+  var cv=document.getElementById('chart');if(!cv)return;
+  var ctx=cv.getContext('2d');
+  var data=[];for(var i=0;i<48;i++)data.push(50+Math.random()*30);
+  function resize(){cv.width=cv.clientWidth*devicePixelRatio;cv.height=cv.clientHeight*devicePixelRatio;}
+  function draw(){
+    var w=cv.width,h=cv.height;ctx.clearRect(0,0,w,h);
+    var g=ctx.createLinearGradient(0,0,0,h);
+    g.addColorStop(0,'rgba(56,189,248,.35)');g.addColorStop(1,'rgba(56,189,248,0)');
+    var step=w/(data.length-1);
+    ctx.beginPath();
+    for(var i=0;i<data.length;i++){var x=i*step,y=h-(data[i]/200)*h;i?ctx.lineTo(x,y):ctx.moveTo(x,y);}
+    ctx.strokeStyle='#38bdf8';ctx.lineWidth=2*devicePixelRatio;ctx.stroke();
+    ctx.lineTo(w,h);ctx.lineTo(0,h);ctx.closePath();ctx.fillStyle=g;ctx.fill();
+  }
+  var logs=['Allocating 4096MB VRAM for transformer blocks...','KV cache synced across distributed nodes.','Attention mechanism optimized: FlashAttention-2 active.','Inference stream #2940 established.','Garbage collection executed. Freed 120MB.','Received embedding vector [dim=8192]. Processing...','Router: Forwarding request to GPU worker 02.','CUDA Core temperature stable at 68C.'];
+  var term=document.getElementById('term');
+  function id(n){return document.getElementById(n);}
+  function tick(){
+    var next=data[data.length-1]+(Math.random()*40-20);
+    data.push(Math.max(20,Math.min(180,next)));data.shift();draw();
+    if(id('vram'))id('vram').textContent=(Math.random()*2+14).toFixed(1)+' GB';
+    if(id('tps'))id('tps').textContent=Math.floor(Math.random()*50+150);
+    if(id('lat'))id('lat').textContent=Math.floor(Math.random()*20+35)+' ms';
+    if(id('str'))id('str').textContent=Math.floor(Math.random()*5+12);
+    if(term&&Math.random()>.55){
+      var d=document.createElement('div'),t=new Date().toISOString().split('T')[1].slice(0,-1);
+      var s=document.createElement('span');s.style.color='#4b5563';s.textContent='['+t+'] ';
+      d.appendChild(s);d.appendChild(document.createTextNode(logs[Math.floor(Math.random()*logs.length)]));
+      term.appendChild(d);
+      while(term.childNodes.length>14)term.removeChild(term.firstChild);
+    }
+  }
+  resize();window.addEventListener('resize',function(){resize();draw();});
+  draw();setInterval(tick,800);
+})();
+`;
+
 const renderAIMatrix = (res) => {
-    const html = `
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>LLM Node Edge Control</title>
-        <script src="https://cdn.tailwindcss.com"></script>
-        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-        <style>
-            @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
-            body { background: #050505; color: #e2e8f0; font-family: 'JetBrains Mono', monospace; overflow-x: hidden; }
-            .grid-bg { background-image: linear-gradient(rgba(25, 25, 30, 0.5) 1px, transparent 1px), linear-gradient(90deg, rgba(25, 25, 30, 0.5) 1px, transparent 1px); background-size: 30px 30px; }
-            .glass { background: rgba(15, 20, 25, 0.6); backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.05); }
-            .glow-text { text-shadow: 0 0 10px rgba(56, 189, 248, 0.6); }
-            .terminal { max-height: 250px; overflow-y: auto; font-size: 0.85rem; }
-            ::-webkit-scrollbar { width: 6px; }
-            ::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
-        </style>
-    </head>
-    <body class="grid-bg min-h-screen p-6 md:p-12">
-        <div class="max-w-7xl mx-auto">
-            <header class="flex justify-between items-end mb-10 border-b border-gray-800 pb-4">
-                <div>
-                    <h1 class="text-3xl font-bold text-sky-400 glow-text tracking-wider">AETHER<span class="text-white">_NODE</span></h1>
-                    <p class="text-gray-500 text-sm mt-1">Distributed Tensor Inference Cluster</p>
-                </div>
-                <div class="flex items-center gap-3">
-                    <span class="relative flex h-3 w-3"><span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span><span class="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span></span>
-                    <span class="text-emerald-500 text-sm font-bold tracking-widest">LIVE</span>
-                </div>
-            </header>
-
-            <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
-                <div class="glass p-5 rounded-lg border-l-4 border-l-sky-500">
-                    <p class="text-gray-500 text-xs mb-1">GPU VRAM USAGE</p>
-                    <div class="text-2xl font-bold text-sky-400" id="vram">-- GB</div>
-                </div>
-                <div class="glass p-5 rounded-lg border-l-4 border-l-indigo-500">
-                    <p class="text-gray-500 text-xs mb-1">TOKENS / SEC</p>
-                    <div class="text-2xl font-bold text-indigo-400" id="tps">--</div>
-                </div>
-                <div class="glass p-5 rounded-lg border-l-4 border-l-rose-500">
-                    <p class="text-gray-500 text-xs mb-1">INFERENCE LATENCY</p>
-                    <div class="text-2xl font-bold text-rose-400" id="latency">-- ms</div>
-                </div>
-                <div class="glass p-5 rounded-lg border-l-4 border-l-amber-500">
-                    <p class="text-gray-500 text-xs mb-1">ACTIVE STREAMS</p>
-                    <div class="text-2xl font-bold text-amber-400" id="streams">--</div>
-                </div>
-            </div>
-
-            <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                <div class="lg:col-span-2 glass p-6 rounded-lg relative h-80">
-                    <p class="absolute top-4 left-6 text-xs text-gray-500 z-10">REAL-TIME TENSOR THROUGHPUT</p>
-                    <canvas id="mainChart"></canvas>
-                </div>
-                <div class="glass p-6 rounded-lg flex flex-col">
-                    <p class="text-xs text-gray-500 mb-4 border-b border-gray-800 pb-2">CLUSTER EVENT LOGS</p>
-                    <div class="terminal flex-1 text-gray-400" id="terminal">
-                        <div class="text-sky-500">>> INITIALIZING AETHER ENGINE v4.2...</div>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <script>
-            const ctx = document.getElementById('mainChart').getContext('2d');
-            const gradient = ctx.createLinearGradient(0, 0, 0, 400);
-            gradient.addColorStop(0, 'rgba(56, 189, 248, 0.4)');
-            gradient.addColorStop(1, 'rgba(56, 189, 248, 0)');
-
-            const chart = new Chart(ctx, {
-                type: 'line',
-                data: {
-                    labels: Array(30).fill(''),
-                    datasets: [{
-                        data: Array(30).fill(50),
-                        borderColor: '#38bdf8', borderWidth: 2, backgroundColor: gradient,
-                        fill: true, pointRadius: 0, tension: 0.3
-                    }]
-                },
-                options: { responsive: true, maintainAspectRatio: false, animation: false, scales: { y: { display: false, min: 0, max: 200 }, x: { display: false } }, plugins: { legend: { display: false } } }
-            });
-
-            const logs = [
-                "Allocating 4096MB VRAM for transformer blocks...",
-                "KV cache synced across distributed nodes.",
-                "Attention mechanism optimized: FlashAttention-2 active.",
-                "Inference stream #2940 established.",
-                "Garbage collection executed. Freed 120MB.",
-                "Received embedding vector [dim=8192]. Processing...",
-                "Router: Forwarding request to GPU worker 02.",
-                "CUDA Core temperature stable at 68°C."
-            ];
-
-            const term = document.getElementById('terminal');
-            
-            setInterval(() => {
-                document.getElementById('vram').innerText = (Math.random() * 2 + 14).toFixed(1) + ' GB';
-                document.getElementById('tps').innerText = Math.floor(Math.random() * 50 + 150);
-                document.getElementById('latency').innerText = Math.floor(Math.random() * 20 + 35) + ' ms';
-                document.getElementById('streams').innerText = Math.floor(Math.random() * 5 + 12);
-                
-                const nextVal = chart.data.datasets[0].data[29] + (Math.random() * 40 - 20);
-                const safeVal = Math.max(20, Math.min(180, nextVal));
-                chart.data.datasets[0].data.push(safeVal);
-                chart.data.datasets[0].data.shift();
-                chart.update();
-
-                if(Math.random() > 0.6) {
-                    const log = document.createElement('div');
-                    const time = new Date().toISOString().split('T')[1].slice(0,-1);
-                    log.innerHTML = \`<span class="text-gray-600">[\${time}]</span> \${logs[Math.floor(Math.random()*logs.length)]}\`;
-                    term.appendChild(log);
-                    term.scrollTop = term.scrollHeight;
-                }
-            }, 800);
-        </script>
-    </body>
-    </html>
-    `;
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    const html = `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM Node Edge Control</title>
+<style>${BASE_CSS}</style>
+</head><body>
+<nav>
+  <div class="brand">AETHER//MATRIX-CORE</div>
+  <div class="navlinks"><a href="/about">About</a><a href="/docs">Docs</a></div>
+</nav>
+<main>
+  <div class="grid g4" style="margin-bottom:16px">
+    <div class="glass card"><div class="label">VRAM ALLOCATION</div><div class="metric sky" id="vram">15.2 GB</div><div class="bar"><i class="bg-sky" style="width:65%"></i></div></div>
+    <div class="glass card"><div class="label">THROUGHPUT (TPS)</div><div class="metric indigo" id="tps">184</div><div class="bar"><i class="bg-indigo" style="width:80%"></i></div></div>
+    <div class="glass card"><div class="label">QUANT TIME LATENCY</div><div class="metric emerald" id="lat">42 ms</div><div class="bar"><i class="bg-emerald" style="width:30%"></i></div></div>
+    <div class="glass card"><div class="label">INFERENCE STREAMS</div><div class="metric amber" id="str">14</div><div class="bar"><i class="bg-amber" style="width:45%"></i></div></div>
+  </div>
+  <div class="grid g2">
+    <div class="glass card" style="grid-column:span 2">
+      <div class="label" style="padding-bottom:8px;border-bottom:1px solid var(--line);margin-bottom:12px">TENSOR PIPELINE EFFICIENCY (REAL-TIME)</div>
+      <canvas id="chart" class="chart"></canvas>
+    </div>
+    <div class="glass card"><div class="label" style="padding-bottom:8px;border-bottom:1px solid var(--line);margin-bottom:8px">CLUSTER EVENT LOGS</div>
+      <div class="terminal" id="term"></div>
+    </div>
+  </div>
+</main>
+<footer>© ${new Date().getFullYear()} Aether Matrix Core — build 4.2.0-prod</footer>
+<script>${DASH_JS}</script>
+</body></html>`;
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
     res.end(html);
 };
 
-// ====================================================================
-// 路由代理与订阅分发
-// ====================================================================
 
 // ====================================================================
-// 兜底伪装：本地静态站 / 302 跳转 / 受限反代
+// 本地静态伪装站 / 订阅分发
 // ====================================================================
 
 const NO_STORE = { 'Cache-Control': 'no-store', 'Content-Type': 'text/plain; charset=utf-8' };
 
-// ---------- 本地静态伪装站（默认，零第三方流量）----------
+// ---------- 本地伪装站（全部本地渲染，无第三方资源）----------
 const PAGE_SHELL = (title, inner) => `<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${title}</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<style>body{background:#050505;color:#cbd5e1;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}</style>
-</head><body class="min-h-screen flex flex-col">
-<nav class="border-b border-gray-800 px-6 py-4 flex items-center justify-between">
-  <a href="/" class="text-sky-400 font-bold tracking-widest">AETHER//MATRIX-CORE</a>
-  <span class="text-xs text-gray-500 space-x-4"><a href="/about" class="hover:text-sky-400">About</a>
-  <a href="/docs" class="hover:text-sky-400">Docs</a></span>
+<style>${BASE_CSS}</style>
+</head><body>
+<nav>
+  <div class="brand">AETHER//MATRIX-CORE</div>
+  <div class="navlinks"><a href="/about">About</a><a href="/docs">Docs</a></div>
 </nav>
-<main class="flex-1 max-w-3xl mx-auto px-6 py-12">${inner}</main>
-<footer class="border-t border-gray-800 px-6 py-6 text-xs text-gray-600">© ${new Date().getFullYear()} Aether Matrix Core. All rights reserved.</footer>
+<main>${inner}</main>
+<footer>© ${new Date().getFullYear()} Aether Matrix Core. All rights reserved.</footer>
 </body></html>`;
 
 const DECOY_PAGES = {
     '/about': () => PAGE_SHELL('About — Aether Matrix Core', `
-        <h1 class="text-2xl font-bold text-gray-100 mb-4">About</h1>
-        <p class="text-sm leading-6 text-gray-400">Aether Matrix Core is an internal inference control plane used to schedule
+        <h1>About</h1>
+        <p class="small dim" style="margin-bottom:12px">Aether Matrix Core is an internal inference control plane used to schedule
         transformer workloads across distributed GPU nodes. The console at the root path exposes live telemetry for
         cluster utilisation, KV-cache synchronisation and stream routing.</p>
-        <p class="text-sm leading-6 text-gray-400 mt-4">The service is operated for research and development purposes.
+        <p class="small dim">The service is operated for research and development purposes in a private environment.
         Public endpoints only expose aggregated, non-personal metrics.</p>`),
     '/docs': () => PAGE_SHELL('Docs — Aether Matrix Core', `
-        <h1 class="text-2xl font-bold text-gray-100 mb-4">Documentation</h1>
-        <ul class="text-sm space-y-3 text-gray-400">
-          <li><span class="text-sky-400">GET /</span> — live cluster console</li>
-          <li><span class="text-sky-400">GET /about</span> — service overview</li>
-          <li><span class="text-sky-400">GET /docs</span> — this page</li>
-          <li><span class="text-sky-400">GET /robots.txt</span> — crawler policy</li>
+        <h1>Documentation</h1>
+        <ul class="docs">
+          <li><span class="sky">GET /</span> — live cluster console</li>
+          <li><span class="sky">GET /about</span> — service overview</li>
+          <li><span class="sky">GET /docs</span> — this page</li>
+          <li><span class="sky">GET /robots.txt</span> — crawler policy</li>
         </ul>
-        <p class="text-xs text-gray-600 mt-6">All telemetry is refreshed every 800 ms from the edge aggregator.</p>`)
+        <p class="small dim" style="margin-top:14px">All telemetry is refreshed every 800 ms from the edge aggregator.</p>`)
 };
 
 const renderNotFound = (res, pathname) => {
     const safe = String(pathname || '/').replace(/[<>&"']/g, '');
     const html = PAGE_SHELL('404 — Not Found', `
-        <h1 class="text-3xl font-bold text-gray-100 mb-3">404</h1>
-        <p class="text-sm text-gray-400">The resource <code class="text-gray-300">${safe}</code>
-        was not found on this server.</p>
-        <p class="text-sm text-gray-500 mt-6"><a href="/" class="text-sky-400 hover:underline">Return to console</a></p>`);
+        <h1>404</h1>
+        <p class="small dim">The resource <code>${safe}</code> was not found on this server.</p>
+        <p class="small" style="margin-top:18px"><a href="/" class="sky">Return to console</a></p>`);
     res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
     res.end(html);
 };
@@ -300,116 +269,6 @@ const serveDecoy = (req, res, pathname) => {
     renderNotFound(res, pathname);
 };
 
-// ---------- 302 跳转（零第三方流量，不当热链/反代）----------
-const fallbackRedirect = (req, res, pathname, search) => {
-    const target = ENV.S_ORIGIN.replace(/\/+$/, '') + pathname + (search || '');
-    res.writeHead(302, { Location: target, 'Cache-Control': 'no-store' });
-    res.end();
-};
-
-// ---------- 受限反代（默认关闭；仅 GET/HEAD + 体积/超时上限 + 缓存）----------
-const MIRROR_MAX_BYTES = 2 * 1024 * 1024;
-const MIRROR_TIMEOUT_MS = 6000;
-const MIRROR_CACHE_TTL_MS = 5 * 60 * 1000;
-const MIRROR_CACHE_MAX = 32;
-const mirrorCache = new Map();   // key -> { at, status, headers, body }
-
-const mirrorCacheGet = (key) => {
-    const hit = mirrorCache.get(key);
-    if (!hit) return null;
-    if (Date.now() - hit.at > MIRROR_CACHE_TTL_MS) { mirrorCache.delete(key); return null; }
-    return hit;
-};
-
-const mirrorCacheSet = (key, entry) => {
-    if (mirrorCache.size >= MIRROR_CACHE_MAX) mirrorCache.delete(mirrorCache.keys().next().value);
-    mirrorCache.set(key, entry);
-};
-
-const fallbackProxy = (req, res, pathname, search) => {
-    // 只允许只读方法，杜绝把节点当成匿名提交/上传跳板
-    if (req.method !== 'GET' && req.method !== 'HEAD') {
-        res.writeHead(405, { ...NO_STORE, Allow: 'GET, HEAD' });
-        return res.end('Method Not Allowed');
-    }
-
-    const key = pathname + (search || '');
-    const cached = mirrorCacheGet(key);
-    if (cached) {
-        res.writeHead(cached.status, cached.headers);
-        return res.end(cached.body);
-    }
-
-    let target;
-    try { target = new URL(key, ENV.S_ORIGIN); } catch (e) { return renderNotFound(res, pathname); }
-    if (target.protocol !== 'https:') return renderNotFound(res, pathname);
-
-    // 显式构造最小请求头：不再透传 cookie / authorization / referer / 请求体
-    const options = {
-        hostname: target.hostname,
-        port: target.port || 443,
-        path: target.pathname + target.search,
-        method: req.method === 'HEAD' ? 'HEAD' : 'GET',
-        timeout: MIRROR_TIMEOUT_MS,
-        headers: {
-            host: target.host,
-            'user-agent': req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-            accept: req.headers.accept || 'text/html,application/xhtml+xml',
-            'accept-encoding': 'identity'
-        }
-    };
-
-    let settled = false;
-    const fail = () => {
-        if (settled) return;
-        settled = true;
-        if (!res.headersSent) renderNotFound(res, pathname);
-        else { try { res.destroy(); } catch (e) {} }
-    };
-
-    const proxyReq = https.request(options, proxyRes => {
-        const status = proxyRes.statusCode || 502;
-        const ctype = proxyRes.headers['content-type'] || '';
-        // 仅缓存可安全复用的小型静态响应，其余直通且不缓存
-        const cacheable = status === 200 && /^(text\/|image\/|application\/javascript)/.test(ctype);
-
-        if (!cacheable) {
-            settled = true;
-            res.writeHead(status, { ...proxyRes.headers, 'Cache-Control': 'no-store' });
-            let sent = 0;
-            proxyRes.on('data', chunk => {
-                sent += chunk.length;
-                if (sent > MIRROR_MAX_BYTES) { try { proxyRes.destroy(); } catch (e) {} try { res.destroy(); } catch (e) {} return; }
-                res.write(chunk);
-            });
-            proxyRes.on('end', () => { if (!res.writableEnded) res.end(); });
-            proxyRes.on('error', () => { try { res.destroy(); } catch (e) {} });
-            return;
-        }
-
-        const chunks = [];
-        let size = 0;
-        proxyRes.on('data', chunk => {
-            size += chunk.length;
-            if (size > MIRROR_MAX_BYTES) { try { proxyRes.destroy(); } catch (e) {} return fail(); }
-            chunks.push(chunk);
-        });
-        proxyRes.on('end', () => {
-            if (settled) return;
-            settled = true;
-            const body = Buffer.concat(chunks);
-            const headers = { 'Content-Type': ctype, 'Cache-Control': 'public, max-age=300' };
-            mirrorCacheSet(key, { at: Date.now(), status, headers, body });
-            res.writeHead(status, headers);
-            res.end(body);
-        });
-        proxyRes.on('error', fail);
-    });
-
-    proxyReq.on('timeout', () => { proxyReq.destroy(); fail(); });
-    proxyReq.on('error', fail);
-    proxyReq.end();   // GET/HEAD 无 body，绝不转发请求体
-};
 
 
 const generateSubscription = (req, res) => {
@@ -848,18 +707,15 @@ const scanSweeper = setInterval(() => {
 }, 60000);
 if (scanSweeper.unref) scanSweeper.unref();
 
-const handleFallback = (req, res, pathname, search) => {
+const handleUnknownPath = (req, res, pathname) => {
     // 扫描器/爬虫对未知路径高频探测时，直接断开比返回内容更省资源
     if (isScanAbuser(clientIp(req))) {
         try { res.writeHead(429, { ...NO_STORE, 'Retry-After': '60' }); res.end('Too Many Requests'); } catch (e) {}
         return;
     }
 
-    switch (ENV.FALLBACK) {
-        case 'redirect': return fallbackRedirect(req, res, pathname, search);
-        case 'proxy': return fallbackProxy(req, res, pathname, search);
-        default: return serveDecoy(req, res, pathname);
-    }
+    // 全部未知路径仅由本地伪装站渲染，不再有任何外部站点转发/跳转
+    return serveDecoy(req, res, pathname);
 };
 
 const server = http.createServer((req, res) => {
@@ -887,8 +743,8 @@ const server = http.createServer((req, res) => {
         return handleXHTTP(req, res, pathname);
     }
 
-    // 其余请求走兜底策略（默认本地伪装站，不再反代第三方站点）
-    return handleFallback(req, res, pathname, url.search);
+    // 其余请求全部由本地伪装站渲染（无任何第三方转发）
+    return handleUnknownPath(req, res, pathname);
 });
 
 // 关闭 Nagle 以降低 XHTTP 小包延迟，并放宽头部/超时限制
