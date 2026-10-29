@@ -539,11 +539,12 @@ if (sweeper.unref) sweeper.unref();
 // ====================================================================
 
 const writeStreamHeaders = (res) => {
+    // 注意：不设置 Connection 等逐跳首部（HTTP/1.1 默认长连接），
+    // 避免经过 h2 终结层/反向代理时出现非法首部。
     res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-store, no-transform',
-        'X-Accel-Buffering': 'no',
-        'Connection': 'keep-alive'
+        'X-Accel-Buffering': 'no'
     });
     if (typeof res.flushHeaders === 'function') res.flushHeaders();
 };
