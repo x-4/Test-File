@@ -18,6 +18,7 @@
 
 const http = require('http');
 const net = require('net');
+const dgram = require('dgram');
 const crypto = require('crypto');
 
 const ENV = { 
@@ -30,7 +31,11 @@ const ENV = {
     SC_MAX_EACH_POST_BYTES: parseInt(process.env.SC_MAX_EACH_POST_BYTES || '1000000', 10),
     SC_MAX_BUFFERED_POSTS: parseInt(process.env.SC_MAX_BUFFERED_POSTS || '30', 10),
     // 进程保护：未通过 UUID 校验的会话上限（Xray 无此限制，Node 需要）
-    MAX_SESSIONS: parseInt(process.env.MAX_SESSIONS || '4096', 10)
+    MAX_SESSIONS: parseInt(process.env.MAX_SESSIONS || '4096', 10),
+    // 订阅链接中的 ALPN，默认同时提供 h2 与 http/1.1
+    ALPN: process.env.ALPN || 'h2,http/1.1',
+    // UDP 出口：direct（真实 UDP 中继，默认）| doh（HTTPS DNS）| auto（direct，失败时 53 端口回退 DoH）
+    UDP_MODE: (process.env.UDP_MODE || 'auto').toLowerCase()
 };
 
 // Xray 客户端 GetNormalizedPath()：path 必须以 '/' 开头，且不含查询串
@@ -82,11 +87,19 @@ Registry.set('resolve', (type, buf) => {
 });
 
 Registry.set('parse', (buf) => {
-    if (buf.length < 24 || !Registry.get('validate')(buf)) return null; 
-    const mLen = buf[17]; 
-    const prot = buf[18 + mLen]; 
-    const port = (buf[19 + mLen] << 8) | buf[20 + mLen]; 
-    let type = buf[21 + mLen]; if (type !== 1) type += 1; 
+    if (buf.length < 19 || !Registry.get('validate')(buf)) return null;
+    const mLen = buf[17];
+    const prot = buf[18 + mLen];
+
+    // cmd=3 为 Mux(XUDP)：官方该请求头只有 version+uuid+addons+command，
+    // 目标地址在 XUDP 帧内，因此不能沿用 port/address 的偏移。
+    if (prot === 3) {
+        return { prot, type: 0, port: 0, clusterId: null, pOff: 19 + mLen };
+    }
+
+    if (buf.length < 24 + mLen) return null;
+    const port = (buf[19 + mLen] << 8) | buf[20 + mLen];
+    let type = buf[21 + mLen]; if (type !== 1) type += 1;
     let aLen = 0, aOff = 22 + mLen;
     if (type === 3) { aLen = buf[aOff]; aOff++; } 
     else if (type === 1) aLen = 4; 
@@ -295,8 +308,9 @@ const generateSubscription = (req, res) => {
     const port = hostPort === String(ENV.PORT) ? '443' : hostPort;
     const tag = encodeURIComponent('Alwaysdata-XHTTP-Node');
     const encPath = encodeURIComponent(ENV.XHTTP_PATH.replace(/\/+$/, '') || '/');
+    const encAlpn = encodeURIComponent(ENV.ALPN);
     // 标准 XHTTP (SplitHTTP) VLESS 分享链接
-    const link = `vless://${ENV.S_TKN}@${hostNoPort}:${port}?encryption=none&security=tls&sni=${hostNoPort}&fp=chrome&type=xhttp&mode=auto&path=${encPath}#${tag}`;
+    const link = `vless://${ENV.S_TKN}@${hostNoPort}:${port}?encryption=none&security=tls&sni=${hostNoPort}&fp=chrome&alpn=${encAlpn}&type=xhttp&mode=auto&path=${encPath}#${tag}`;
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
     res.end(Buffer.from(link).toString('base64'));
 };
@@ -312,6 +326,36 @@ const SESSIONS = new Map();
 // 无 sessionId 的 stream-one 单流会话（按连接标识）
 const streamOneSessions = new Map();
 
+// ---- XUDP（Xray 的 UDP over Mux 封装）：VLESS cmd=3 + 帧结构 ----
+// 帧： [2B metaLen][2B sessionID][status][opt][cmd=2][2B port][atyp][addr][8B globalID?][2B dataLen][data]
+// 回包：[2B metaLen=4][2B sessionID][status=2][opt=1][2B dataLen][data]
+const readAddrPort = (buf, off) => {
+    if (off + 3 > buf.length) return null;
+    const port = (buf[off] << 8) | buf[off + 1];
+    const atyp = buf[off + 2];
+    let p = off + 3;
+    let host;
+    if (atyp === 1) {
+        if (p + 4 > buf.length) return null;
+        host = `${buf[p]}.${buf[p + 1]}.${buf[p + 2]}.${buf[p + 3]}`;
+        p += 4;
+    } else if (atyp === 2) {
+        const len = buf[p]; p += 1;
+        if (p + len > buf.length) return null;
+        host = buf.toString('utf8', p, p + len);
+        p += len;
+    } else if (atyp === 3) {
+        if (p + 16 > buf.length) return null;
+        const seg = [];
+        for (let i = 0; i < 8; i++) seg.push(buf.readUInt16BE(p + i * 2).toString(16));
+        host = seg.join(':');
+        p += 16;
+    } else {
+        return null;
+    }
+    return { host, port };
+};
+
 const SESSION_TTL = 30000;        // 官方：GET 未连上时 30 秒回收会话
 // 官方对已建立下行的会话不做空闲回收（会话与 GET 同生命周期）。
 // 这里只设一个很长的兜底上限，避免半开连接永久占用内存，同时不误杀长时间静默的隧道
@@ -319,6 +363,13 @@ const SESSION_TTL = 30000;        // 官方：GET 未连上时 30 秒回收会�
 const SESSION_MAX_IDLE = parseInt(process.env.SESSION_MAX_IDLE_MS || '1800000', 10);
 // 官方 scMaxBufferedPosts 默认 30，超限即断开重排缓冲
 const MAX_REASSEMBLY = ENV.SC_MAX_BUFFERED_POSTS > 0 ? ENV.SC_MAX_BUFFERED_POSTS : 30;
+
+// UDP 出口模式（direct：真实 UDP 中继；doh：HTTPS DNS；auto：direct 失败时 53 端口回退 DoH）
+const UDP_MODE = ENV.UDP_MODE;
+// stream-up 上行保活间隔：客户端会丢弃响应体，用 'X' 防止中间层判定静默
+const STREAM_UP_KEEPALIVE_MS = Math.max(5000, parseInt(process.env.STREAM_UP_KEEPALIVE_MS || '20000', 10));
+// TCP 层保活：不产生任何应用层字节，因此不会破坏 VLESS 流，是空闲下行的唯一合法保活方式
+const TCP_KEEPALIVE_MS = Math.max(5000, parseInt(process.env.TCP_KEEPALIVE_MS || '30000', 10));
 
 // 调试日志（默认关闭，排查链路时设 DEBUG=1）
 const DEBUG = process.env.DEBUG === '1';
@@ -332,6 +383,12 @@ class Session {
         this.isFirstPacket = true;
         this.isUDP = false;
         this.udpBuffer = Buffer.alloc(0);
+        this.udpSocket = null;
+        this.udpHost = '';
+        this.udpPort = 0;
+        this.isXudp = false;
+        this.xudpBuffer = Buffer.alloc(0);
+        this.xudpSid = null;
         this.closed = false;
         this.pending = new Map();    // seq -> Buffer
         this.pendingDown = [];       // 下行尚未建立时的临时缓冲
@@ -415,6 +472,7 @@ class Session {
         if (this.isFirstPacket) {
             this.isFirstPacket = false;
             const meta = Registry.get('parse')(buf);
+            dbg('first-packet', 'len=' + buf.length, 'cmd=' + meta.prot, 'port=' + meta.port, 'type=' + meta.type);
             if (!meta) { this.destroy(); return; }
 
             // VLESS 服务端握手响应：[version, 0]
@@ -422,9 +480,22 @@ class Session {
 
             const initial = buf.subarray(meta.pOff);
 
-            if (meta.prot === 2) {           // UDP（仅 DoH 处理 53 端口）
+            if (meta.prot === 3) {           // XUDP：Xray 的 UDP over Mux（cmd=3）
                 this.isUDP = true;
-                if (meta.port !== 53) { this.destroy(); return; }
+                this.isXudp = true;
+                dbg('xudp open');
+                if (initial.length > 0) {
+                    this.xudpBuffer = initial;
+                    this.processXudp();
+                }
+                return;
+            }
+
+            if (meta.prot === 2) {           // UDP：VLESS 数据在 TCP(XHTTP) 内承载，服务端用 dgram 中继
+                this.isUDP = true;
+                this.udpHost = Registry.get('resolve')(meta.type, meta.clusterId);
+                this.udpPort = meta.port;
+                dbg('udp open', this.udpHost + ':' + this.udpPort, 'mode=' + UDP_MODE);
                 if (initial.length > 0) {
                     this.udpBuffer = initial;
                     this.processUDP();
@@ -441,6 +512,7 @@ class Session {
             });
 
             this.edgeSocket.setNoDelay(true);
+            try { this.edgeSocket.setKeepAlive(true, TCP_KEEPALIVE_MS); } catch (e) {}
             this.edgeSocket.on('data', chunk => this.sendDownstream(chunk));
             this.edgeSocket.on('error', () => this.destroy());
             this.edgeSocket.on('close', () => this.destroy());
@@ -448,22 +520,143 @@ class Session {
         }
 
         if (this.isUDP) {
-            this.udpBuffer = Buffer.concat([this.udpBuffer, buf]);
-            this.processUDP();
+            if (this.isXudp) {
+                this.xudpBuffer = Buffer.concat([this.xudpBuffer, buf]);
+                this.processXudp();
+            } else {
+                this.udpBuffer = Buffer.concat([this.udpBuffer, buf]);
+                this.processUDP();
+            }
         } else if (this.edgeSocket && !this.edgeSocket.destroyed) {
             this.edgeSocket.write(buf);
         }
     }
 
-    // UDP 帧格式：[2 字节长度][DNS 报文]，通过 DoH 转发
+    // XUDP 解帧：可在一个 TCP 流中连续解析多个数据报
+    processXudp() {
+        while (!this.closed && this.xudpBuffer.length >= 4) {
+            const metaLen = this.xudpBuffer.readUInt16BE(0);
+            if (metaLen < 4) { this.destroy(); return; }
+            if (this.xudpBuffer.length < 2 + metaLen + 2) return;   // 元信息 + dataLen 尚未到齐
+            const meta = this.xudpBuffer.subarray(2, 2 + metaLen);
+            const status = meta[2];
+            const opt = meta[3];
+
+            const dataLenOff = 2 + metaLen;
+            const dataLen = this.xudpBuffer.readUInt16BE(dataLenOff);
+            const dataOff = dataLenOff + 2;
+            if (this.xudpBuffer.length < dataOff + dataLen) return;
+
+            const datagram = this.xudpBuffer.subarray(dataOff, dataOff + dataLen);
+            this.xudpBuffer = this.xudpBuffer.subarray(dataOff + dataLen);
+
+            // 记录 sessionID，回包时原样带回
+            if (!this.xudpSid) this.xudpSid = [meta[0], meta[1]];
+
+            // meta 中携带目标地址（New 必带；Keep 在 cone/变更目的地址时带）
+            if (metaLen > 6) {
+                const cmd = meta[4];
+                if (cmd !== 2) {           // 只支持 UDP，不实现 Mux 里的 TCP 复用
+                    dbg('xudp unsupported cmd', cmd);
+                    this.destroy();
+                    return;
+                }
+                const dest = readAddrPort(meta, 5);
+                if (dest) { this.udpHost = dest.host; this.udpPort = dest.port; }
+            }
+
+            if (opt === 1 && dataLen > 0) {
+                if (!this.udpHost) { this.destroy(); return; }
+                dbg('xudp datagram', this.udpHost + ':' + this.udpPort, dataLen + 'B', 'status=' + status);
+                this.dispatchUdp(datagram);
+            }
+        }
+    }
+
+    // XUDP 回包：[2B metaLen=4][2B sessionID][status=2 Keep][opt=1][2B len][data]
+    sendXudp(datagram) {
+        const sid = this.xudpSid || [0, 0];
+        const frame = Buffer.allocUnsafe(2 + 4 + 2 + datagram.length);
+        frame.writeUInt16BE(4, 0);         // metaLen
+        frame[2] = sid[0];
+        frame[3] = sid[1];
+        frame[4] = 2;                      // status: Keep
+        frame[5] = 1;                      // opt: 带数据
+        frame.writeUInt16BE(datagram.length, 6);
+        datagram.copy(frame, 8);
+        this.sendDownstream(frame);
+    }
+
+    // 普通 VLESS UDP 帧格式：[2 字节长度][数据报]（mihomo / sing-box 等客户端）
     processUDP() {
         while (!this.closed && this.udpBuffer.length >= 2) {
             const len = (this.udpBuffer[0] << 8) | this.udpBuffer[1];
             if (this.udpBuffer.length < 2 + len) break;
-            const query = this.udpBuffer.subarray(2, 2 + len);
+            const datagram = this.udpBuffer.subarray(2, 2 + len);
             this.udpBuffer = this.udpBuffer.subarray(2 + len);
-            this.resolveDoH(query);
+            this.dispatchUdp(datagram);
         }
+    }
+
+    // DNS(53) 在多数 PaaS 上无法出 UDP，auto 模式改用 DoH；其余端口一律走真实 UDP
+    shouldUseDoh() {
+        if (UDP_MODE === 'doh') return true;
+        return UDP_MODE === 'auto' && this.udpPort === 53;
+    }
+
+    dispatchUdp(datagram) {
+        if (this.shouldUseDoh()) return this.resolveDoH(datagram);
+        this.sendUdp(datagram);
+    }
+
+    // 直连 UDP：UDP 报文封装在 TCP 里穿过 XHTTP，服务端再以真实 UDP 发往目标
+    sendUdp(datagram) {
+        const sock = this.ensureUdpSocket();
+        if (!sock) return this.udpDowngrade(datagram);
+        try {
+            sock.send(datagram, 0, datagram.length, this.udpPort, this.udpHost, err => {
+                if (err) this.udpDowngrade(datagram);
+            });
+        } catch (e) {
+            this.udpDowngrade(datagram);
+        }
+    }
+
+    ensureUdpSocket() {
+        if (this.udpSocket) return this.udpSocket;
+        if (this.closed) return null;
+
+        const family = this.udpHost && this.udpHost.includes(':') ? 'udp6' : 'udp4';
+        let sock;
+        try { sock = dgram.createSocket(family); } catch (e) { return null; }
+
+        sock.on('message', msg => {
+            if (this.closed) return;
+            if (this.isXudp) return this.sendXudp(msg);
+            const frame = Buffer.allocUnsafe(2 + msg.length);
+            frame[0] = (msg.length >> 8) & 0xFF;
+            frame[1] = msg.length & 0xFF;
+            msg.copy(frame, 2);
+            this.sendDownstream(frame);
+        });
+        sock.on('error', e => {
+            dbg('udp error', e && e.message);
+            this.udpSocket = null;
+            try { sock.close(); } catch (_) {}
+            // 出错后对该会话后续报文走回退路径（DoH 仅对 53 端口）
+            this.udpBroken = true;
+        });
+        sock.unref && sock.unref();
+
+        this.udpSocket = sock;
+        return sock;
+    }
+
+    // 直连 UDP 不可用时的回退：auto 模式下仅对 DNS(53) 走 DoH，其余断开
+    udpDowngrade(datagram) {
+        if (UDP_MODE === 'auto' && this.udpPort === 53) return this.resolveDoH(datagram);
+        dbg('udp unsupported', this.udpHost + ':' + this.udpPort);
+        this.destroy();
     }
 
     async resolveDoH(query) {
@@ -495,6 +688,7 @@ class Session {
         if (SESSIONS.get(this.id) === this) SESSIONS.delete(this.id);
         if (streamOneSessions.get(this.id) === this) streamOneSessions.delete(this.id);
         if (this.edgeSocket) { this.edgeSocket.destroy(); this.edgeSocket = null; }
+        if (this.udpSocket) { try { this.udpSocket.close(); } catch (e) {} this.udpSocket = null; }
         this.pending.clear();
         this.pendingDown = [];
         this.pendingDownBytes = 0;
@@ -658,7 +852,7 @@ const handleStreamUp = (req, res, sessionId) => {
     const keepAlive = setInterval(() => {
         if (res.writableEnded || session.closed) { clearInterval(keepAlive); return; }
         try { res.write(Buffer.from('X')); } catch (e) { clearInterval(keepAlive); }
-    }, 20000);
+    }, STREAM_UP_KEEPALIVE_MS);
     if (keepAlive.unref) keepAlive.unref();
 
     const cleanup = () => { clearInterval(keepAlive); if (!res.writableEnded) { try { res.end(); } catch (e) {} } };
@@ -854,10 +1048,21 @@ const server = http.createServer((req, res) => {
     return handleUnknownPath(req, res, pathname);
 });
 
-// 关闭 Nagle 以降低 XHTTP 小包延迟，并放宽头部/超时限制
-server.keepAliveTimeout = 65000;
-server.headersTimeout = 70000;
-server.requestTimeout = 0;
+// XHTTP 调优：低延迟 + 长连接不被 Node 自身中断
+server.keepAliveTimeout = 75000;   // 空闲 keep-alive 连接（无进行中请求）保留时间
+server.headersTimeout = 80000;     // 必须大于 keepAliveTimeout
+server.requestTimeout = 0;         // 关闭整请求超时，否则 stream-up 长 POST 会被切断
+server.maxRequestsPerSocket = 0;   // 不限制单连接复用次数（packet-up 会频繁复用）
+server.timeout = 0;                // 不因 socket 空闲而关闭（空闲下行由 TCP keep-alive 维持）
+
+// 入站连接：关闭 Nagle + 开启 TCP keep-alive
+// TCP keep-alive 只发 ACK 级探测包，不产生应用层字节，因此不会破坏 VLESS 流，
+// 是保持空闲下行（SSE）不被 PaaS/中间设备按空闲超时掐断的唯一合法手段。
+server.on('connection', socket => {
+    try { socket.setNoDelay(true); } catch (e) {}
+    try { socket.setKeepAlive(true, TCP_KEEPALIVE_MS); } catch (e) {}
+});
+
 server.on('clientError', (err, socket) => {
     try { socket.destroy(); } catch (e) {}
 });
