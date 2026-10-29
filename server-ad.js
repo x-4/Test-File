@@ -11,6 +11,10 @@
 //   SC_MAX_BUFFERED_POSTS  乱序重排缓冲包数，默认 30（对齐 Xray 默认）
 //   MAX_SESSIONS           并发会话上限，默认 4096（Node 侧保护）
 //   SESSION_MAX_IDLE_MS    已建立下行的会话兜底回收时间，默认 1800000
+//   ALPN                   订阅链接里的 ALPN，默认 h2,http/1.1
+//   UDP_MODE               auto（默认，53 走 DoH、其余真实 UDP）| direct | doh
+//   TCP_KEEPALIVE_MS       入站/出站 TCP keep-alive 间隔，默认 30000
+//   STREAM_UP_KEEPALIVE_MS stream-up 上行保活间隔，默认 20000
 //   DEBUG                  设为 1 输出 XHTTP 调试日志
 //
 // 未知路径一律由本地静态伪装站响应，不存在任何第三方站点转发/跳转能力。
