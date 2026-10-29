@@ -3,10 +3,15 @@
 //
 // 纯 XHTTP（Xray SplitHTTP）传输的 VLESS 服务端，无 WebSocket 依赖。
 // 环境变量：
-//   UUID             必填，节点鉴权 ID（同时作为订阅路径 /<UUID>）
-//   PORT             监听端口，默认 8100
-//   IP               监听地址，默认 0.0.0.0
-//   XHTTP_PATH       XHTTP 传输路径，默认 /xh
+//   UUID                   必填，节点鉴权 ID（同时作为订阅路径 /<UUID>）
+//   PORT                   监听端口，默认 8100
+//   IP                     监听地址，默认 0.0.0.0
+//   XHTTP_PATH             XHTTP 传输路径，默认 /xh（需与订阅链接 path 一致）
+//   SC_MAX_EACH_POST_BYTES packet-up 单次 POST 上限，默认 1000000（对齐 Xray 默认）
+//   SC_MAX_BUFFERED_POSTS  乱序重排缓冲包数，默认 30（对齐 Xray 默认）
+//   MAX_SESSIONS           并发会话上限，默认 4096（Node 侧保护）
+//   SESSION_MAX_IDLE_MS    已建立下行的会话兜底回收时间，默认 1800000
+//   DEBUG                  设为 1 输出 XHTTP 调试日志
 //
 // 未知路径一律由本地静态伪装站响应，不存在任何第三方站点转发/跳转能力。
 // ====================================================================
@@ -20,8 +25,19 @@ const ENV = {
     // 【核心修复1】适配 Alwaysdata 注入的内部 IP 和端口
     PORT: process.env.PORT || 8100,
     IP: process.env.IP || '0.0.0.0',
-    XHTTP_PATH: process.env.XHTTP_PATH || '/xh'
+    XHTTP_PATH: process.env.XHTTP_PATH || '/xh',
+    // 与 Xray 服务端默认值保持一致（splithttp.GetNormalized*）
+    SC_MAX_EACH_POST_BYTES: parseInt(process.env.SC_MAX_EACH_POST_BYTES || '1000000', 10),
+    SC_MAX_BUFFERED_POSTS: parseInt(process.env.SC_MAX_BUFFERED_POSTS || '30', 10),
+    // 进程保护：未通过 UUID 校验的会话上限（Xray 无此限制，Node 需要）
+    MAX_SESSIONS: parseInt(process.env.MAX_SESSIONS || '4096', 10)
 };
+
+// Xray 客户端 GetNormalizedPath()：path 必须以 '/' 开头，且不含查询串
+if (!/^\//.test(ENV.XHTTP_PATH) || /[?#\s]/.test(ENV.XHTTP_PATH)) {
+    console.error('[FATAL] XHTTP_PATH 必须是形如 /xh 的绝对路径（不能包含查询串或空格）。');
+    process.exit(1);
+}
 
 // 缺少或非法 UUID 时直接退出：避免以可预测的空凭证对外提供服务
 if (!/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(ENV.S_TKN)) {
@@ -296,9 +312,17 @@ const SESSIONS = new Map();
 // 无 sessionId 的 stream-one 单流会话（按连接标识）
 const streamOneSessions = new Map();
 
-const SESSION_TTL = 30000;        // 客户端必须在 30 秒内建立关联
-const SESSION_TIMEOUT = 120000;   // 已建立关联后的空闲超时
-const MAX_REASSEMBLY = 128;       // packet-up 乱序重排缓冲上限
+const SESSION_TTL = 30000;        // 官方：GET 未连上时 30 秒回收会话
+// 官方对已建立下行的会话不做空闲回收（会话与 GET 同生命周期）。
+// 这里只设一个很长的兜底上限，避免半开连接永久占用内存，同时不误杀长时间静默的隧道
+// （例如 SSH / 数据库长连接）。可用 SESSION_MAX_IDLE_MS 覆盖。
+const SESSION_MAX_IDLE = parseInt(process.env.SESSION_MAX_IDLE_MS || '1800000', 10);
+// 官方 scMaxBufferedPosts 默认 30，超限即断开重排缓冲
+const MAX_REASSEMBLY = ENV.SC_MAX_BUFFERED_POSTS > 0 ? ENV.SC_MAX_BUFFERED_POSTS : 30;
+
+// 调试日志（默认关闭，排查链路时设 DEBUG=1）
+const DEBUG = process.env.DEBUG === '1';
+const dbg = (...args) => { if (DEBUG) console.log('[xh]', ...args); };
 
 class Session {
     constructor(id) {
@@ -467,6 +491,7 @@ class Session {
     destroy() {
         if (this.closed) return;
         this.closed = true;
+        dbg('sess', this.id, 'close');
         if (SESSIONS.get(this.id) === this) SESSIONS.delete(this.id);
         if (streamOneSessions.get(this.id) === this) streamOneSessions.delete(this.id);
         if (this.edgeSocket) { this.edgeSocket.destroy(); this.edgeSocket = null; }
@@ -479,25 +504,31 @@ class Session {
     }
 }
 
+// 官方无会话上限（Go 侧开销极低）；Node 需要防止未经 UUID 校验的 GET 耗尽内存
 const getSession = (id) => {
     let s = SESSIONS.get(id);
     if (!s || s.closed) {
+        if (SESSIONS.size >= ENV.MAX_SESSIONS) {
+            // 先做一次回收再判定
+            sweep();
+            if (SESSIONS.size >= ENV.MAX_SESSIONS) return null;
+        }
         s = new Session(id);
         SESSIONS.set(id, s);
     }
     return s;
 };
 
-// 统一回收僵死会话：未建立下行时用较短 TTL，已建立后按空闲活动判断
+// 统一回收僵死会话：未建立下行时用官方 30s TTL；已建立下行时仅做超长兜底回收
 const sweep = () => {
     const now = Date.now();
     for (const s of SESSIONS.values()) {
         const idle = now - s.lastActive;
-        const limit = s.res ? SESSION_TIMEOUT : SESSION_TTL;
-        if (idle > limit) s.destroy();
+        const limit = s.res ? SESSION_MAX_IDLE : SESSION_TTL;
+        if (idle > limit) { dbg('sess', s.id, 'reap idle=' + idle, s.res ? 'down' : 'no-down'); s.destroy(); }
     }
     for (const s of streamOneSessions.values()) {
-        if (now - s.lastActive > SESSION_TIMEOUT) s.destroy();
+        if (now - s.lastActive > SESSION_MAX_IDLE) s.destroy();
     }
 };
 const sweeper = setInterval(sweep, 5000);
@@ -517,17 +548,32 @@ const writeStreamHeaders = (res) => {
     if (typeof res.flushHeaders === 'function') res.flushHeaders();
 };
 
-// 收集 packet-up 上行数据：header(X-Data-N) + cookie(x_data_N) + body
+// 会话数达到 MAX_SESSIONS 时的快速失败（官方无此分支，Node 侧保护）
+const overloaded = (res) => {
+    if (!res.headersSent) {
+        res.writeHead(503, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store', 'Retry-After': '5' });
+    }
+    try { res.end('Service Unavailable'); } catch (e) {}
+};
+
+// Xray 客户端使用 base64.RawURLEncoding（URL 安全、无填充）编码 header/cookie 分片
+const decodeB64 = (str) => {
+    const s = String(str).replace(/-/g, '+').replace(/_/g, '/');
+    const pad = s.length % 4 === 0 ? s : s + '='.repeat(4 - (s.length % 4));
+    return Buffer.from(pad, 'base64');
+};
+
+// 收集 packet-up 上行数据：官方顺序 header(X-Data-N) + cookie(x_data_N) + body
 const collectUplinkPayload = (req, body) => {
     const parts = [];
 
     const headerChunks = [];
     for (let i = 0; ; i++) {
-        const v = req.headers[('x-data-' + i).toLowerCase()];
+        const v = req.headers['x-data-' + i];
         if (!v) break;
         headerChunks.push(Array.isArray(v) ? v.join('') : v);
     }
-    if (headerChunks.length) parts.push(Buffer.from(headerChunks.join(''), 'base64'));
+    if (headerChunks.length) parts.push(decodeB64(headerChunks.join('')));
 
     const cookieChunks = [];
     const rawCookie = req.headers.cookie || '';
@@ -537,18 +583,33 @@ const collectUplinkPayload = (req, body) => {
         if (!hit) break;
         cookieChunks.push(hit.slice(name.length + 1));
     }
-    if (cookieChunks.length) parts.push(Buffer.from(cookieChunks.join(''), 'base64'));
+    if (cookieChunks.length) parts.push(decodeB64(cookieChunks.join('')));
 
     if (body && body.length) parts.push(body);
 
     return parts.length > 1 ? Buffer.concat(parts) : (parts[0] || Buffer.alloc(0));
 };
 
-const readBody = (req, cb) => {
+// 读取请求体并强制 scMaxEachPostBytes 上限（官方超限返回 413）
+const readBodyLimited = (req, max, cb) => {
+    const declared = Number(req.headers['content-length'] || 0);
+    if (declared > max) return cb(new Error('too-large'), null);
+
     const chunks = [];
-    req.on('data', c => chunks.push(c));
-    req.on('end', () => cb(Buffer.concat(chunks)));
-    req.on('error', () => cb(Buffer.alloc(0)));
+    let size = 0;
+    let done = false;
+    const finish = (err, buf) => { if (done) return; done = true; cb(err, buf); };
+
+    req.on('data', c => {
+        size += c.length;
+        if (size > max) {
+            try { req.destroy(); } catch (e) {}
+            return finish(new Error('too-large'), null);
+        }
+        chunks.push(c);
+    });
+    req.on('end', () => finish(null, Buffer.concat(chunks)));
+    req.on('error', () => finish(new Error('aborted'), null));
 };
 
 // ---------- stream-one：单个请求同时承载上下行 ----------
@@ -567,8 +628,11 @@ const handleStreamOne = (req, res) => {
 const handleDownstream = (req, res, sessionId) => {
     if (!sessionId) return handleStreamOne(req, res);
 
-    writeStreamHeaders(res);
     const session = getSession(sessionId);
+    if (!session) { dbg('down', sessionId, '->503'); return overloaded(res); }
+    dbg('down', sessionId, 'open');
+
+    writeStreamHeaders(res);
     session.attachDownstream(res);
 
     // 兼容 stream-one 变体：GET 携带 body 时同样作为上行数据
@@ -579,7 +643,9 @@ const handleDownstream = (req, res, sessionId) => {
 // ---------- 上行流（stream-up） ----------
 const handleStreamUp = (req, res, sessionId) => {
     const session = getSession(sessionId);
+    if (!session) return overloaded(res);
 
+    dbg('up', sessionId, 'stream-up open');
     res.writeHead(200, {
         'Cache-Control': 'no-store',
         'X-Accel-Buffering': 'no',
@@ -604,11 +670,31 @@ const handleStreamUp = (req, res, sessionId) => {
 
 // ---------- 上行包（packet-up） ----------
 const handlePacketUp = (req, res, sessionId, seqStr) => {
-    const session = getSession(sessionId);
+    // 官方第 326 行：strconv.ParseUint(seqStr) 失败即报错，这里回 400 而不是静默丢弃
+    if (!/^\d+$/.test(seqStr)) {
+        res.writeHead(400, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
+        return res.end('Invalid sequence');
+    }
 
-    readBody(req, body => {
+    const session = getSession(sessionId);
+    if (!session) return overloaded(res);
+
+    readBodyLimited(req, ENV.SC_MAX_EACH_POST_BYTES, (err, body) => {
+        if (err) {
+            // 超限 413 / 中断 400，与官方 StatusRequestEntityTooLarge 对齐
+            const code = err.message === 'too-large' ? 413 : 400;
+            if (!res.writableEnded) {
+                res.writeHead(code, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
+                res.end(code === 413 ? 'Request Entity Too Large' : 'Bad Request');
+            }
+            return;
+        }
+
         const payload = collectUplinkPayload(req, body);
-        if (payload.length) session.pushPacket(seqStr, payload);
+        dbg('post', sessionId, 'seq', seqStr, 'bytes', payload.length);
+        // 即使 payload 为空也占用该 seq，保证重排窗口能推进（对齐官方 uploadQueue）
+        session.pushPacket(seqStr, payload);
+
         if (!res.writableEnded) {
             res.writeHead(200, { 'Cache-Control': 'no-store' });
             res.end();
@@ -629,6 +715,18 @@ const applyCors = (req, res) => {
     res.setHeader('Access-Control-Allow-Credentials', 'true');
 };
 
+// 解析 Xray 默认放置方式生成的子路径：<path> | <path>/<sessionId> | <path>/<sessionId>/<seq>
+// 对照官方：GetNormalizedPath() 会在 session/seq 位于 path 时补尾部 '/'，
+// 提取方式为 strings.Split(req.URL.Path[len(path):], "/")，空段必须保留。
+const parseXhttpPath = (pathname) => {
+    const rest = pathname.slice(XHTTP_PREFIX.length);
+    const parts = rest.split('/');
+    if (parts[0] === '') parts.shift();                        // 去掉 path 后的第一个 '/'
+    if (parts.length && parts[parts.length - 1] === '') parts.pop();  // 去掉 GetNormalizedPath 补的尾部 '/'
+    if (parts.length > 2) return null;                        // 非法层级
+    return { sessionId: parts[0] || '', seqStr: parts[1] || '' };
+};
+
 const handleXHTTP = (req, res, pathname) => {
     applyCors(req, res);
 
@@ -638,11 +736,19 @@ const handleXHTTP = (req, res, pathname) => {
         return true;
     }
 
-    // 解析子路径：/xh | /xh/<sessionId> | /xh/<sessionId>/<seq>
-    const rest = pathname.slice(XHTTP_PREFIX.length).replace(/^\/+/, '');
-    const parts = rest.length ? rest.split('/') : [];
-    const sessionId = parts[0] || '';
-    const seqStr = parts[1] || '';
+    const parsed = parseXhttpPath(pathname);
+    if (!parsed) {
+        // 与官方一致：路径不匹配即 404（这里渲染本地伪装 404 页）
+        renderNotFound(res, pathname);
+        return true;
+    }
+    const { sessionId, seqStr } = parsed;
+
+    // seq 必须与 sessionId 同时出现（seq 位置在 path 时）
+    if (seqStr !== '' && sessionId === '') {
+        renderNotFound(res, pathname);
+        return true;
+    }
 
     if (req.method === 'GET') {
         if (seqStr !== '') {
@@ -664,7 +770,7 @@ const handleXHTTP = (req, res, pathname) => {
         return true;
     }
 
-    res.writeHead(405, { 'Content-Type': 'text/plain' });
+    res.writeHead(405, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store', Allow: 'GET, POST, OPTIONS' });
     res.end('Method Not Allowed');
     return true;
 };
