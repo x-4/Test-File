@@ -22,6 +22,8 @@
 //   Node.js >= 16（推荐 18/20 LTS）。仅使用内置模块（http/https/net/dgram/crypto/fs/os），
 //   无 npm 依赖、无原生扩展，因此在 x86_64 / arm64 / armv7 / 其他 Node 支持的架构上行为一致；
 //   Linux / macOS / Windows 均可运行（cgroup 内存上限仅 Linux 读取，其余回退 os.totalmem()）。
+//   H2C_ONLY=1 可切换为明文 HTTP/2 监听：仅用于「平台以 h2 回源到应用」的场景，
+//   因为 Node 的明文 h2 服务无法与 HTTP/1.1 共用同一端口。
 //
 // 未知路径一律由本地静态伪装站响应，不存在任何第三方站点转发/跳转能力。
 // 唯一的外部出站是可选 DoH（UDP 被封时的 DNS 兜底），且仅访问公共 DNS 解析器。
@@ -1194,7 +1196,7 @@ const handleUnknownPath = (req, res, pathname) => {
     return serveDecoy(req, res, pathname);
 };
 
-const server = http.createServer((req, res) => {
+const handleRequest = (req, res) => {
     let url;
     try {
         url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -1221,14 +1223,24 @@ const server = http.createServer((req, res) => {
 
     // 其余请求全部由本地伪装站渲染（无任何第三方转发）
     return handleUnknownPath(req, res, pathname);
-});
+};
 
-// XHTTP 调优：低延迟 + 长连接不被 Node 自身中断
-server.keepAliveTimeout = 75000;   // 空闲 keep-alive 连接（无进行中请求）保留时间
-server.headersTimeout = 80000;     // 必须大于 keepAliveTimeout
-server.requestTimeout = 0;         // 关闭整请求超时，否则 stream-up 长 POST 会被切断
-server.maxRequestsPerSocket = 0;   // 不限制单连接复用次数（packet-up 会频繁复用）
-server.timeout = 0;                // 不因 socket 空闲而关闭（空闲下行由 TCP keep-alive 维持）
+// 传输层选择：默认 HTTP/1.1（PaaS 回源绝大多数是 h1.1）。
+// H2C_ONLY=1 时改为明文 HTTP/2 监听——仅用于「平台确实以 h2 回源到应用」的少数场景，
+// 因为 Node 的 http2 明文服务不支持与 h1.1 共用同一端口（allowHTTP1 只对 TLS+ALPN 生效）。
+const H2C_ONLY = process.env.H2C_ONLY === '1';
+const server = H2C_ONLY
+    ? require('http2').createServer(handleRequest)
+    : http.createServer(handleRequest);
+
+// H2C 模式下 http2 服务没有这些 http1 专有属性，赋值前先判断，避免行为差异
+if (!H2C_ONLY) {
+    server.keepAliveTimeout = 75000;   // 空闲 keep-alive 连接（无进行中请求）保留时间
+    server.headersTimeout = 80000;     // 必须大于 keepAliveTimeout
+    server.requestTimeout = 0;         // 关闭整请求超时，否则 stream-up 长 POST 会被切断
+    server.maxRequestsPerSocket = 0;   // 不限制单连接复用次数（packet-up 会频繁复用）
+    server.timeout = 0;                // 不因 socket 空闲而关闭（空闲下行由 TCP keep-alive 维持）
+}
 
 // 入站连接：关闭 Nagle + 开启 TCP keep-alive
 // TCP keep-alive 只发 ACK 级探测包，不产生应用层字节，因此不会破坏 VLESS 流，
