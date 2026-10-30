@@ -2,19 +2,20 @@
 // Void AI Matrix Service (XHTTP / SplitHTTP Alwaysdata Edition)
 //
 // 纯 XHTTP（Xray SplitHTTP）传输的 VLESS 服务端，无 WebSocket 依赖。
-// 环境变量：
+// 环境变量（★ = 留空即自适应，通常无需配置）：
 //   UUID                   必填，节点鉴权 ID（同时作为订阅路径 /<UUID>）
-//   PORT                   监听端口，默认 8100
-//   IP                     监听地址，默认 0.0.0.0
+//   PORT                   监听端口，默认 8100（PaaS 通常自动注入）
+//   IP                     监听地址，默认 0.0.0.0（PaaS 通常自动注入）
 //   XHTTP_PATH             XHTTP 传输路径，默认 /xh（需与订阅链接 path 一致）
 //   SC_MAX_EACH_POST_BYTES packet-up 单次 POST 上限，默认 1000000（对齐 Xray 默认）
 //   SC_MAX_BUFFERED_POSTS  乱序重排缓冲包数，默认 30（对齐 Xray 默认）
-//   MAX_SESSIONS           并发会话上限，默认 4096（Node 侧保护）
+//   MAX_SESSIONS         ★ 并发会话上限，留空按内存自动推算（256–8192）
 //   SESSION_MAX_IDLE_MS    已建立下行的会话兜底回收时间，默认 1800000
-//   ALPN                   订阅链接里的 ALPN，默认 h2,http/1.1
-//   UDP_MODE               auto（默认，53 走 DoH、其余真实 UDP）| direct | doh
-//   TCP_KEEPALIVE_MS       入站/出站 TCP keep-alive 间隔，默认 30000
-//   STREAM_UP_KEEPALIVE_MS stream-up 上行保活间隔，默认 20000
+//   ALPN                 ★ 订阅里的 ALPN，默认 h2,http/1.1（按边缘能力调整）
+//   UDP_MODE             ★ auto 默认：自动探测出网 UDP，可用则 53 也走真实 UDP，否则 DNS 走 DoH
+//   UDP_PROBE_TARGET       出网探测目标，默认 1.1.1.1:53
+//   TCP_KEEPALIVE_MS     ★ 入站/出站 TCP keep-alive，默认 30000（按 PaaS 空闲阈值调）
+//   STREAM_UP_KEEPALIVE_MS ★ stream-up 上行保活，默认 20000
 //   DEBUG                  设为 1 输出 XHTTP 调试日志
 //
 // 未知路径一律由本地静态伪装站响应，不存在任何第三方站点转发/跳转能力。
@@ -24,6 +25,8 @@ const http = require('http');
 const net = require('net');
 const dgram = require('dgram');
 const crypto = require('crypto');
+const fs = require('fs');
+const os = require('os');
 
 const ENV = { 
     S_TKN: process.env.UUID || '', 
@@ -34,13 +37,68 @@ const ENV = {
     // 与 Xray 服务端默认值保持一致（splithttp.GetNormalized*）
     SC_MAX_EACH_POST_BYTES: parseInt(process.env.SC_MAX_EACH_POST_BYTES || '1000000', 10),
     SC_MAX_BUFFERED_POSTS: parseInt(process.env.SC_MAX_BUFFERED_POSTS || '30', 10),
-    // 进程保护：未通过 UUID 校验的会话上限（Xray 无此限制，Node 需要）
-    MAX_SESSIONS: parseInt(process.env.MAX_SESSIONS || '4096', 10),
+    // 进程保护：未通过 UUID 校验的会话上限；0 / 未设置时按内存自动推算
+    MAX_SESSIONS: parseInt(process.env.MAX_SESSIONS || '0', 10) || 0,
     // 订阅链接中的 ALPN，默认同时提供 h2 与 http/1.1
     ALPN: process.env.ALPN || 'h2,http/1.1',
-    // UDP 出口：direct（真实 UDP 中继，默认）| doh（HTTPS DNS）| auto（direct，失败时 53 端口回退 DoH）
+    // UDP 出口：auto（默认，探测出网能力后决定）| direct（强制真实 UDP）| doh（强制 HTTPS DNS）
     UDP_MODE: (process.env.UDP_MODE || 'auto').toLowerCase()
 };
+
+// --------------------------------------------------------------------
+// 自适应：内存上限（容器 cgroup 优先）→ 并发会话上限
+// --------------------------------------------------------------------
+const readCgroupLimit = (path) => {
+    try {
+        const raw = fs.readFileSync(path, 'utf8').trim();
+        if (raw === 'max') return 0;
+        const n = parseInt(raw, 10);
+        return Number.isFinite(n) && n > 0 ? n : 0;
+    } catch (e) { return 0; }
+};
+
+const MEM_LIMIT = (() => {
+    const v2 = readCgroupLimit('/sys/fs/cgroup/memory.max');
+    if (v2 > 0) return v2;
+    const v1 = readCgroupLimit('/sys/fs/cgroup/memory/memory.limit_in_bytes');
+    if (v1 > 0 && v1 < Number.MAX_SAFE_INTEGER) return v1;
+    return os.totalmem();
+})();
+
+// 每个活跃会话按最多 ~2MB（1MB 上行分片 + 256KB 下行缓冲 + 排序窗口）保守估算
+const MAX_SESSIONS = ENV.MAX_SESSIONS > 0
+    ? ENV.MAX_SESSIONS
+    : Math.min(8192, Math.max(256, Math.floor(MEM_LIMIT / (2 * 1024 * 1024))));
+
+// --------------------------------------------------------------------
+// 自适应：UDP 出网能力探测（决定 auto 模式下 :53 走真实 UDP 还是 DoH）
+// 探测本身不改行为，未完成/失败时统一按“不可用”处理，即 DNS 走 DoH（更稳）
+// --------------------------------------------------------------------
+const UDP_PROBE_TARGET = process.env.UDP_PROBE_TARGET || '1.1.1.1';
+let UDP_EGRESS = false;
+
+const probeUdpEgress = () => new Promise(resolve => {
+    let sock;
+    let settled = false;
+    const done = (ok) => {
+        if (settled) return;
+        settled = true;
+        try { sock && sock.close(); } catch (e) {}
+        resolve(ok);
+    };
+    try { sock = dgram.createSocket('udp4'); } catch (e) { return done(false); }
+
+    sock.once('error', () => done(false));
+    sock.once('message', () => done(true));
+    const timer = setTimeout(() => done(false), 1500);
+    if (timer.unref) timer.unref();
+
+    // 最小的 DNS 查询（example.com A）
+    const q = Buffer.from('abcd01000001000000000000076578616d706c6503636f6d0000010001', 'hex');
+    try {
+        sock.send(q, 53, UDP_PROBE_TARGET, err => { if (err) done(false); });
+    } catch (e) { done(false); }
+});
 
 // Xray 客户端 GetNormalizedPath()：path 必须以 '/' 开头，且不含查询串
 if (!/^\//.test(ENV.XHTTP_PATH) || /[?#\s]/.test(ENV.XHTTP_PATH)) {
@@ -602,14 +660,18 @@ class Session {
         }
     }
 
-    // DNS(53) 在多数 PaaS 上无法出 UDP，auto 模式改用 DoH；其余端口一律走真实 UDP
+    // auto：探测到本机可出 UDP 时，:53 也走真实 UDP；否则 DNS 改走 DoH（多数 PaaS 禁 UDP 出网）。
+    // 其余端口没有 HTTP 层替代方案，始终走真实 UDP 中继。
     shouldUseDoh() {
         if (UDP_MODE === 'doh') return true;
-        return UDP_MODE === 'auto' && this.udpPort === 53;
+        if (UDP_MODE === 'direct') return false;
+        return this.udpPort === 53 && !UDP_EGRESS;
     }
 
     dispatchUdp(datagram) {
-        if (this.shouldUseDoh()) return this.resolveDoH(datagram);
+        const viaDoh = this.shouldUseDoh();
+        dbg('udp via', viaDoh ? 'DoH' : 'direct', this.udpHost + ':' + this.udpPort);
+        if (viaDoh) return this.resolveDoH(datagram);
         this.sendUdp(datagram);
     }
 
@@ -706,10 +768,10 @@ class Session {
 const getSession = (id) => {
     let s = SESSIONS.get(id);
     if (!s || s.closed) {
-        if (SESSIONS.size >= ENV.MAX_SESSIONS) {
+        if (SESSIONS.size >= MAX_SESSIONS) {
             // 先做一次回收再判定
             sweep();
-            if (SESSIONS.size >= ENV.MAX_SESSIONS) return null;
+            if (SESSIONS.size >= MAX_SESSIONS) return null;
         }
         s = new Session(id);
         SESSIONS.set(id, s);
@@ -1075,5 +1137,19 @@ server.on('clientError', (err, socket) => {
 server.listen(ENV.PORT, ENV.IP, () => {
     console.log(`Aether Node Operations Active on ${ENV.IP}:${ENV.PORT} (XHTTP/SplitHTTP)`);
     console.log(`XHTTP path: ${XHTTP_PREFIX}`);
+
+    // 自适应：内存上限 → 会话上限；UDP 出网能力 → auto 模式 DNS 路径
+    console.log(`mem limit: ${(MEM_LIMIT / 1048576).toFixed(0)} MB, max sessions: ${MAX_SESSIONS}${ENV.MAX_SESSIONS > 0 ? ' (env)' : ' (auto)'}`);
+    console.log(`udp mode: ${UDP_MODE}${UDP_MODE === 'auto' ? ' (probing outbound UDP...)' : ''}`);
+
+    if (UDP_MODE === 'auto') {
+        probeUdpEgress().then(ok => {
+            UDP_EGRESS = ok;
+            console.log(`udp egress: ${ok ? 'available -> :53 via real UDP' : 'blocked -> :53 via DoH'}`);
+        });
+    } else {
+        UDP_EGRESS = UDP_MODE === 'direct';
+        console.log(`udp egress: forced ${UDP_MODE}`);
+    }
 });
 
