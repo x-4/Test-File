@@ -1158,11 +1158,20 @@ const scanTable = new Map();     // ip -> { count, resetAt }
 
 // PaaS/CDN 会终结 TLS 并使用自身 IP 回源，因此优先取 XFF 最右侧（由可信代理追加）以保证
 // 限速的按客户端粒度；缺失时退回 socket 地址。
+// 真实客户端 IP：Cloudflare(CF-Connecting-IP) → XFF 最右侧（由可信代理追加）→ socket 地址
+// TRUST_PROXY=0 时忽略代理头（仅在 service 直接暴露于公网、无前置代理时使用）
+const TRUST_PROXY = process.env.TRUST_PROXY !== '0';
+
 const clientIp = (req) => {
-    const xff = req.headers['x-forwarded-for'];
-    if (typeof xff === 'string' && xff.length) {
-        const last = xff.split(',').pop().trim();
-        if (last) return last;
+    if (TRUST_PROXY) {
+        const cf = req.headers['cf-connecting-ip'];
+        if (typeof cf === 'string' && cf.trim()) return cf.trim();
+
+        const xff = req.headers['x-forwarded-for'];
+        if (typeof xff === 'string' && xff.length) {
+            const last = xff.split(',').pop().trim();
+            if (last) return last;
+        }
     }
     return (req.socket && req.socket.remoteAddress) || 'unknown';
 };
