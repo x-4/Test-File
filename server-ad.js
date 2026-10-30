@@ -18,10 +18,17 @@
 //   STREAM_UP_KEEPALIVE_MS ★ stream-up 上行保活，默认 20000
 //   DEBUG                  设为 1 输出 XHTTP 调试日志
 //
+// 运行时要求：
+//   Node.js >= 16（推荐 18/20 LTS）。仅使用内置模块（http/https/net/dgram/crypto/fs/os），
+//   无 npm 依赖、无原生扩展，因此在 x86_64 / arm64 / armv7 / 其他 Node 支持的架构上行为一致；
+//   Linux / macOS / Windows 均可运行（cgroup 内存上限仅 Linux 读取，其余回退 os.totalmem()）。
+//
 // 未知路径一律由本地静态伪装站响应，不存在任何第三方站点转发/跳转能力。
+// 唯一的外部出站是可选 DoH（UDP 被封时的 DNS 兜底），且仅访问公共 DNS 解析器。
 // ====================================================================
 
 const http = require('http');
+const https = require('https');
 const net = require('net');
 const dgram = require('dgram');
 const crypto = require('crypto');
@@ -112,8 +119,20 @@ if (!/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{1
     process.exit(1);
 }
 
-process.on('uncaughtException', () => {});
-process.on('unhandledRejection', () => {});
+// 进程级异常：保持存活（单连接故障不应拖垮节点），但必须留下日志，不能静默吞掉
+let _errWindowStart = Date.now();
+let _errInWindow = 0;
+
+const reportError = (kind, err) => {
+    const now = Date.now();
+    if (now - _errWindowStart > 60000) { _errWindowStart = now; _errInWindow = 0; }
+    if (_errInWindow++ > 20) return;   // 限流，避免日志风暴拖慢进程
+    const msg = err && (err.stack || err.message) ? (err.stack || err.message) : String(err);
+    console.error(`[${kind}]`, msg);
+};
+
+process.on('uncaughtException', (err) => reportError('uncaughtException', err));
+process.on('unhandledRejection', (err) => reportError('unhandledRejection', err));
 
 // ====================================================================
 // 核心调度注册表 (防静态分析)
@@ -383,6 +402,45 @@ const generateSubscription = (req, res) => {
 
 const DOH_ENDPOINTS = ['aHR0cHM6Ly8xLjEuMS4xL2Rucy1xdWVyeQ==','aHR0cHM6Ly9kbnMuZ29vZ2xlL2Rucy1xdWVyeQ==','aHR0cHM6Ly85LjkuOS45L2Rucy1xdWVyeQ=='].map(b64 => Buffer.from(b64, 'base64').toString('utf8'));
 
+// DoH 单次查询（内置 https，无第三方依赖；带连接/响应超时，避免挂死会话）
+const DOH_TIMEOUT_MS = parseInt(process.env.DOH_TIMEOUT_MS || '5000', 10);
+
+const dohQuery = (endpoint, body) => new Promise((resolve, reject) => {
+    let url;
+    try { url = new URL(endpoint); } catch (e) { return reject(e); }
+    if (url.protocol !== 'https:') return reject(new Error('doh endpoint must be https'));
+
+    const req = https.request({
+        protocol: 'https:',
+        hostname: url.hostname,
+        port: url.port || 443,
+        path: (url.pathname || '/') + (url.search || ''),
+        method: 'POST',
+        timeout: DOH_TIMEOUT_MS,
+        headers: {
+            'Host': url.host,
+            'Accept': 'application/dns-message',
+            'Content-Type': 'application/dns-message',
+            'Content-Length': body.length
+        }
+    }, res => {
+        if (res.statusCode !== 200) { res.resume(); return reject(new Error('doh status ' + res.statusCode)); }
+        const chunks = [];
+        let size = 0;
+        res.on('data', c => {
+            size += c.length;
+            if (size > 65535) { try { res.destroy(); } catch (e) {} return reject(new Error('doh response too large')); }
+            chunks.push(c);
+        });
+        res.on('end', () => resolve(Buffer.concat(chunks)));
+        res.on('error', reject);
+    });
+
+    req.on('timeout', () => req.destroy(new Error('doh timeout')));
+    req.on('error', reject);
+    req.end(body);
+});
+
 // 会话表：sessionId -> Session
 const SESSIONS = new Map();
 // 无 sessionId 的 stream-one 单流会话（按连接标识）
@@ -432,6 +490,8 @@ const UDP_MODE = ENV.UDP_MODE;
 const STREAM_UP_KEEPALIVE_MS = Math.max(5000, parseInt(process.env.STREAM_UP_KEEPALIVE_MS || '20000', 10));
 // TCP 层保活：不产生任何应用层字节，因此不会破坏 VLESS 流，是空闲下行的唯一合法保活方式
 const TCP_KEEPALIVE_MS = Math.max(5000, parseInt(process.env.TCP_KEEPALIVE_MS || '30000', 10));
+// 目标 TCP 连接阶段超时（不影响已建立连接的空闲时长）
+const EDGE_CONNECT_TIMEOUT_MS = Math.max(2000, parseInt(process.env.EDGE_CONNECT_TIMEOUT_MS || '10000', 10));
 
 // 调试日志（默认关闭，排查链路时设 DEBUG=1）
 const DEBUG = process.env.DEBUG === '1';
@@ -449,6 +509,9 @@ class Session {
         this.udpHost = '';
         this.udpPort = 0;
         this.isXudp = false;
+        this.edgePaused = false;
+        this.inputPaused = false;
+        this.input = null;
         this.xudpBuffer = Buffer.alloc(0);
         this.xudpSid = null;
         this.closed = false;
@@ -503,7 +566,46 @@ class Session {
             return;
         }
 
-        try { this.res.write(buf); } catch (e) { this.destroy(); }
+        let ok = true;
+        try { ok = this.res.write(buf); } catch (e) { return this.destroy(); }
+
+        // 背压：客户端读得慢时暂停读取目标 socket，避免 Node 侧无限缓冲吃光内存
+        if (ok === false) this.pauseEdge();
+    }
+
+    pauseEdge() {
+        const s = this.edgeSocket;
+        if (!s || s.destroyed || this.edgePaused) return;
+        this.edgePaused = true;
+        try { s.pause(); } catch (e) {}
+        const resume = () => {
+            this.edgePaused = false;
+            if (this.edgeSocket && !this.edgeSocket.destroyed) {
+                try { this.edgeSocket.resume(); } catch (e) {}
+            }
+        };
+        if (this.res && !this.res.writableEnded) this.res.once('drain', resume);
+        else resume();
+    }
+
+    // 上行写入目标 socket；写不动时暂停读取入站请求，等 drain 再恢复
+    writeEdge(buf) {
+        const s = this.edgeSocket;
+        if (this.closed || !s || s.destroyed) return;
+        let ok = true;
+        try { ok = s.write(buf); } catch (e) { return this.destroy(); }
+        if (ok === false) this.pauseInput(s);
+    }
+
+    pauseInput(sock) {
+        const req = this.input;
+        if (!req || this.inputPaused || sock.destroyed) return;
+        this.inputPaused = true;
+        try { req.pause(); } catch (e) { this.inputPaused = false; return; }
+        sock.once('drain', () => {
+            this.inputPaused = false;
+            try { req.resume(); } catch (e) {}
+        });
     }
 
     pushPacket(seq, payload) {
@@ -567,11 +669,19 @@ class Session {
 
             // TCP 直连目标
             const host = Registry.get('resolve')(meta.type, meta.clusterId);
+            let edgeConnected = false;
             this.edgeSocket = net.createConnection({ host: host, port: meta.port }, () => {
-                if (initial.length > 0 && this.edgeSocket && !this.edgeSocket.destroyed) {
-                    this.edgeSocket.write(initial);
-                }
+                edgeConnected = true;
+                clearTimeout(connectTimer);
+                if (initial.length > 0) this.writeEdge(initial);
             });
+
+            // 连接阶段超时：目标被黑洞/不可达时不能一直占着会话（不影响已建立连接的空闲时长）
+            const connectTimer = setTimeout(() => {
+                if (!edgeConnected) { dbg('edge connect timeout', host + ':' + meta.port); this.destroy(); }
+            }, EDGE_CONNECT_TIMEOUT_MS);
+            if (connectTimer.unref) connectTimer.unref();
+            this.edgeSocket.once('close', () => clearTimeout(connectTimer));
 
             this.edgeSocket.setNoDelay(true);
             try { this.edgeSocket.setKeepAlive(true, TCP_KEEPALIVE_MS); } catch (e) {}
@@ -589,8 +699,8 @@ class Session {
                 this.udpBuffer = Buffer.concat([this.udpBuffer, buf]);
                 this.processUDP();
             }
-        } else if (this.edgeSocket && !this.edgeSocket.destroyed) {
-            this.edgeSocket.write(buf);
+        } else {
+            this.writeEdge(buf);
         }
     }
 
@@ -725,26 +835,22 @@ class Session {
         this.destroy();
     }
 
+    // DoH：用内置 https 客户端实现，避免依赖全局 fetch（Node <18 无 fetch，且 fetch 无超时会挂住）
     async resolveDoH(query) {
         for (const endpoint of DOH_ENDPOINTS) {
             if (this.closed) return;
             try {
-                const response = await fetch(endpoint, {
-                    method: 'POST',
-                    headers: { 'Accept': 'application/dns-message', 'Content-Type': 'application/dns-message' },
-                    body: query
-                });
-                if (response.ok) {
-                    const respArray = new Uint8Array(await response.arrayBuffer());
-                    const frame = Buffer.alloc(2 + respArray.length);
-                    frame[0] = respArray.length >> 8;
-                    frame[1] = respArray.length & 0xFF;
-                    frame.set(respArray, 2);
-                    this.sendDownstream(frame);
-                    return;
-                }
+                const answer = await dohQuery(endpoint, query);
+                if (!answer || answer.length === 0) continue;
+                const frame = Buffer.allocUnsafe(2 + answer.length);
+                frame[0] = (answer.length >> 8) & 0xFF;
+                frame[1] = answer.length & 0xFF;
+                answer.copy(frame, 2);
+                this.sendDownstream(frame);
+                return;
             } catch (e) { /* 尝试下一个 DoH 节点 */ }
         }
+        dbg('doh all endpoints failed for', this.udpHost + ':' + this.udpPort);
     }
 
     destroy() {
@@ -879,6 +985,7 @@ const handleStreamOne = (req, res) => {
     const id = 'one-' + crypto.randomUUID();
     const session = new Session(id);
     streamOneSessions.set(id, session);
+    session.input = req;
     session.attachDownstream(res);
     req.on('data', chunk => session.feed(chunk));
     req.on('end', () => session.destroy());
@@ -892,6 +999,7 @@ const handleDownstream = (req, res, sessionId) => {
     const session = getSession(sessionId);
     if (!session) { dbg('down', sessionId, '->503'); return overloaded(res); }
     dbg('down', sessionId, 'open');
+    session.input = req;
 
     writeStreamHeaders(res);
     session.attachDownstream(res);
@@ -907,6 +1015,7 @@ const handleStreamUp = (req, res, sessionId) => {
     if (!session) return overloaded(res);
 
     dbg('up', sessionId, 'stream-up open');
+    session.input = req;
     res.writeHead(200, {
         'Cache-Control': 'no-store',
         'X-Accel-Buffering': 'no',
@@ -1132,6 +1241,27 @@ server.on('connection', socket => {
 server.on('clientError', (err, socket) => {
     try { socket.destroy(); } catch (e) {}
 });
+
+// 监听失败（EADDRINUSE / EACCES 等）必须显式退出并打印，否则会被 uncaughtException 静默吃掉
+server.on('error', (err) => {
+    console.error('[FATAL] server error:', err && (err.code || err.message));
+    process.exit(1);
+});
+
+// 优雅停机：PaaS 重部署会发 SIGTERM，先停止接收再主动关闭隧道，避免连接悬挂
+let shuttingDown = false;
+const shutdown = (sig) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[shutdown] ${sig}, closing ${SESSIONS.size} session(s)`);
+    try { server.close(); } catch (e) {}
+    for (const s of SESSIONS.values()) s.destroy();
+    for (const s of streamOneSessions.values()) s.destroy();
+    const t = setTimeout(() => process.exit(0), 500);
+    if (t.unref) t.unref();
+};
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 
 // 【核心修复2】强制绑定 ENV.IP，否则 Alwaysdata 反向代理无法找到你的服务
 server.listen(ENV.PORT, ENV.IP, () => {
